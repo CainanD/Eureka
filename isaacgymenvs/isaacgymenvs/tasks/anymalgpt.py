@@ -12,7 +12,7 @@ from isaacgymenvs.tasks.base.vec_task import VecTask
 from typing import Tuple, Dict
 
 
-class Anymal(VecTask):
+class AnymalGPT(VecTask):
 
     def __init__(self, cfg, rl_device, sim_device, graphics_device_id, headless, virtual_screen_capture, force_render):
 
@@ -200,6 +200,9 @@ class Anymal(VecTask):
         self.compute_reward(self.actions)
 
     def compute_reward(self, actions):
+        self.rew_buf[:], self.rew_dict = quat_rotate_inverse(self.q, self.v)
+        self.extras['gpt_reward'] = self.rew_buf.mean()
+        for rew_state in self.rew_dict: self.extras[rew_state] = self.rew_dict[rew_state].mean()
         self.gt_rew_buf, self.reset_buf[:], self.consecutive_successes[:] = compute_success(
             self.root_states,
             self.commands,
@@ -334,3 +337,12 @@ def compute_success(
     consecutive_successes = -(lin_vel_error + ang_vel_error).mean()
 
     return total_reward.detach(), reset, consecutive_successes
+
+from typing import Tuple, Dict
+import math
+import torch
+from torch import Tensor
+@torch.jit.script
+def quat_rotate_inverse(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    # rotate v by inverse of quaternion q
+    return quat_rotate(quat_conjugate(q), v)

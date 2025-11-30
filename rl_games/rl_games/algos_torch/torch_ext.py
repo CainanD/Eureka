@@ -6,6 +6,7 @@ import torch.optim as optim
 from torch.optim.optimizer import Optimizer
 import math
 import time
+import os
 
 numpy_to_torch_dtype_dict = {
     np.dtype('bool')       : torch.bool,
@@ -75,10 +76,11 @@ def safe_load(filename):
     return safe_filesystem_op(torch.load, filename)
 
 def save_checkpoint(filename, state):
-    print("=> saving checkpoint '{}'".format(filename + '.pth'))
-    # print(state, filename)
-    # from ipdb import set_trace; set_trace()
-    safe_save(state, filename + '.pth')
+    # Ensure .pth suffix and get absolute path
+    filepath = os.path.abspath(filename + '.pth')
+
+    print(f"=> saving checkpoint '{filepath}'")
+    safe_save(state, filepath)
 
 def load_checkpoint(filename):
     print("=> loading checkpoint '{}'".format(filename))

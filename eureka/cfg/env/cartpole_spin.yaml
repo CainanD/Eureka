@@ -1,0 +1,4 @@
+task: CartpoleSpin
+env_name: cartpole_spin
+description: make the pole spin full rotations consecutively, but slowly.
+# description: make the pole spin faster! weeee

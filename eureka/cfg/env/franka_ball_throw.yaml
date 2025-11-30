@@ -1,0 +1,4 @@
+task: FrankaBallThrow
+env_name: franka_ball_throw
+description: to throw a ball and hit a target
+max_iterations: 10000

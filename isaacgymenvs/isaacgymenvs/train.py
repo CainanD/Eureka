@@ -123,21 +123,32 @@ def launch_rlg_hydra(cfg: DictConfig):
             **kwargs,
         )
         if cfg.capture_video:
+            print("===========capturing video==========")
             envs.is_vector_env = True
             if cfg.test:
-                envs = gym.wrappers.RecordVideo(
-                    envs,
-                    f"videos/{run_name}",
-                    step_trigger=lambda step: (step % cfg.capture_video_freq == 0),
-                    video_length=cfg.capture_video_len,
-                )
-            else:
                 envs = gym.wrappers.RecordVideo(
                     envs,
                     f"videos/{run_name}",
                     step_trigger=lambda step: (step % cfg.capture_video_freq == 0) and (step > 0),
                     video_length=cfg.capture_video_len,
                 )
+            else:
+                # For some reason, the rendered videos start with 2 frames from the previous episode and cuts off two frames
+                # from the current episode
+
+                # Bad solution: render episode e and e+1 -> stitch frames e_{2:} and e+1{:2}
+                # good solution: TODO
+                envs = gym.wrappers.RecordVideo(
+                    envs,
+                    f"videos/{run_name}",
+                    episode_trigger=lambda step: (
+                        step % cfg.capture_video_freq == 0 or 
+                        step % cfg.capture_video_freq == 1)
+                    #step_trigger=lambda step: (step % cfg.capture_video_freq == 0) and (step > 0),
+                    #video_length=cfg.capture_video_len,
+                )
+        else:
+            print("!!!!!video not captured!!!!!")
         return envs
 
     env_configurations.register('rlgpu', {

@@ -6,7 +6,7 @@ import torch
 from isaacgym import gymutil, gymtorch, gymapi
 from .base.vec_task import VecTask
 
-class Cartpole(VecTask):
+class CartpoleGPT(VecTask):
 
     def __init__(self, cfg, rl_device, sim_device, graphics_device_id, headless, virtual_screen_capture, force_render):
         self.cfg = cfg
@@ -87,6 +87,9 @@ class Cartpole(VecTask):
             self.cartpole_handles.append(cartpole_handle)
 
     def compute_reward(self):
+        self.rew_buf[:], self.rew_dict = compute_reward(self.dof_pos, self.dof_vel)
+        self.extras['gpt_reward'] = self.rew_buf.mean()
+        for rew_state in self.rew_dict: self.extras[rew_state] = self.rew_dict[rew_state].mean()
         pole_angle = self.obs_buf[:, 2]
         pole_vel = self.obs_buf[:, 3]
         cart_vel = self.obs_buf[:, 1]
@@ -165,3 +168,41 @@ def compute_success(pole_angle, pole_vel, cart_vel, cart_pos,
         consecutive_successes = torch.zeros_like(consecutive_successes).mean()
     
     return reward, reset, consecutive_successes
+
+from typing import Tuple, Dict
+import math
+import torch
+from torch import Tensor
+@torch.jit.script
+def compute_reward(dof_pos: torch.Tensor, dof_vel: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """
+    Compute reward for the Cartpole environment to keep the pole upright and minimize pole velocity.
+    Inputs:
+        dof_pos: tensor of shape [num_envs, 2], position of cart (0) and pole angle (1)
+        dof_vel: tensor of shape [num_envs, 2], velocity of cart (0) and pole angular velocity (1)
+    Outputs:
+        reward: tensor of shape [num_envs], total reward per environment
+        info: dict with individual reward components
+    """
+    pole_angle = dof_pos[:, 1]
+    pole_angular_vel = dof_vel[:, 1]
+
+    # Temperature parameters for exponential transformations
+    angle_temp = torch.tensor(1.0)
+    angular_vel_temp = torch.tensor(1.0)
+
+    # Reward component 1: Pole uprightness (angle close to zero)
+    uprightness = torch.exp(- (pole_angle ** 2) / angle_temp)
+
+    # Reward component 2: Pole angular velocity close to zero
+    stable_velocity = torch.exp(- (pole_angular_vel ** 2) / angular_vel_temp)
+
+    # Combine rewards by multiplication to encourage both objectives
+    reward = uprightness * stable_velocity
+
+    info = {
+        "uprightness": uprightness,
+        "stable_velocity": stable_velocity,
+    }
+
+    return reward, info

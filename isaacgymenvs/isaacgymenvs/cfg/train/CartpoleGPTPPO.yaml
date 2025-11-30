@@ -15,7 +15,7 @@ params:
     kl_threshold: 0.008
     learning_rate: 3e-4
     lr_schedule: adaptive
-    max_epochs: ${resolve_default:100,${....max_iterations}}
+    max_epochs: ${resolve_default:50,${....max_iterations}}
     mini_epochs: 8
     minibatch_size: 8192
     mixed_precision: false

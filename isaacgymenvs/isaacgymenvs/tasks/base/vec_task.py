@@ -300,12 +300,35 @@ class VecTask(Env):
         Returns:
             the Isaac Gym sim object.
         """
+        if self.cfg.get("capture_video", False):
+            self._create_camera_sensor(self.envs[0], env_idx=0)
+
         sim = _create_sim_once(self.gym, compute_device, graphics_device, physics_engine, sim_params)
         if sim is None:
             print("*** Failed to create sim")
             quit()
 
         return sim
+
+    def _create_camera_sensor(self, env_handle, env_idx=0):
+        """Create a camera sensor for a specific environment"""
+        if not hasattr(self, 'cameras'):
+            self.cameras = []
+        
+        camera_props = gymapi.CameraProperties()
+        camera_props.width = 1280
+        camera_props.height = 720
+        camera_props.enable_tensors = True
+        
+        camera_handle = self.gym.create_camera_sensor(env_handle, camera_props)
+        
+        # Position camera to view the environment
+        cam_pos = gymapi.Vec3(3, 3, 2)
+        cam_target = gymapi.Vec3(0, 0, 0.5)
+        self.gym.set_camera_location(camera_handle, env_handle, cam_pos, cam_target)
+        
+        self.cameras.append(camera_handle)
+        return camera_handle
 
     def get_state(self):
         """Returns the state buffer of the environment (the privileged observations for asymmetric training)."""
@@ -422,38 +445,64 @@ class VecTask(Env):
 
         return self.obs_dict, done_env_ids
 
-    def render(self, mode="rgb_array"):
-        """Draw the frame to the viewer, and check for keyboard events."""
-        if self.viewer:
-            # check for window closed
-            if self.gym.query_viewer_has_closed(self.viewer):
-                sys.exit()
 
-            # check for keyboard events
-            for evt in self.gym.query_viewer_action_events(self.viewer):
-                if evt.action == "QUIT" and evt.value > 0:
-                    sys.exit()
-                elif evt.action == "toggle_viewer_sync" and evt.value > 0:
-                    self.enable_viewer_sync = not self.enable_viewer_sync
+    def render(self, mode="rgb_array", env_idx=0):
+        """Render a specific environment using its camera sensor"""
+        if mode == "rgb_array":
+            # If we haven't created cameras yet, create one for env_idx
+            if not hasattr(self, 'cameras') or len(self.cameras) == 0:
+                self._create_camera_sensor(self.envs[env_idx], env_idx)
 
-            # fetch results
             if self.device != 'cpu':
                 self.gym.fetch_results(self.sim, True)
 
-            # step graphics
-            if self.enable_viewer_sync:
-                self.gym.step_graphics(self.sim)
-                self.gym.draw_viewer(self.viewer, self.sim, True)
+            # Render all camera sensors
+            self.gym.render_all_camera_sensors(self.sim)
+            self.gym.step_graphics(self.sim)
+            self.gym.sync_frame_time(self.sim)
+            
+            # Get the image from the camera
+            camera_handle = self.cameras[0]
+            camera_img = self.gym.get_camera_image(
+                self.sim, self.envs[env_idx], camera_handle, gymapi.IMAGE_COLOR
+            )
+            
+            # Convert to numpy array and reshape
+            camera_img = camera_img.reshape(720, 1280, 4)[:, :, :3]  # Remove alpha channel
+            
+            return camera_img
+        else:
+            if self.viewer:
+                # check for window closed
+                if self.gym.query_viewer_has_closed(self.viewer):
+                    sys.exit()
 
-                # Wait for dt to elapse in real time.
-                # This synchronizes the physics simulation with the rendering rate.
-                self.gym.sync_frame_time(self.sim)
-            else:
-                self.gym.poll_viewer_events(self.viewer)
+                # check for keyboard events
+                for evt in self.gym.query_viewer_action_events(self.viewer):
+                    if evt.action == "QUIT" and evt.value > 0:
+                        sys.exit()
+                    elif evt.action == "toggle_viewer_sync" and evt.value > 0:
+                        self.enable_viewer_sync = not self.enable_viewer_sync
 
-            if self.virtual_display and mode == "rgb_array":
-                img = self.virtual_display.grab()
-                return np.array(img)
+                # fetch results
+                if self.device != 'cpu':
+                    self.gym.fetch_results(self.sim, True)
+
+                # step graphics
+                if self.enable_viewer_sync:
+                    self.gym.step_graphics(self.sim)
+                    self.gym.draw_viewer(self.viewer, self.sim, True)
+
+                    # Wait for dt to elapse in real time.
+                    # This synchronizes the physics simulation with the rendering rate.
+                    self.gym.sync_frame_time(self.sim)
+                else:
+                    self.gym.poll_viewer_events(self.viewer)
+
+                if self.virtual_display and mode == "rgb_array":
+                    img = self.virtual_display.grab()
+                    return np.array(img)
+                
 
     def __parse_sim_params(self, physics_engine: str, config_sim: Dict[str, Any]) -> gymapi.SimParams:
         """Parse the config dictionary for physics stepping settings.

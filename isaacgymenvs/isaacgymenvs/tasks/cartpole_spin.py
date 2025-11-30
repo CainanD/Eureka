@@ -1,3 +1,30 @@
+# Copyright (c) 2018-2023, NVIDIA Corporation
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+#    list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+#    contributors may be used to endorse or promote products derived from
+#    this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import numpy as np
 import os
@@ -6,7 +33,7 @@ import torch
 from isaacgym import gymutil, gymtorch, gymapi
 from .base.vec_task import VecTask
 
-class Cartpole(VecTask):
+class CartpoleSpin(VecTask):
 
     def __init__(self, cfg, rl_device, sim_device, graphics_device_id, headless, virtual_screen_capture, force_render):
         self.cfg = cfg
@@ -14,7 +41,7 @@ class Cartpole(VecTask):
         self.reset_dist = self.cfg["env"]["resetDist"]
 
         self.max_push_effort = self.cfg["env"]["maxEffort"]
-        self.max_episode_length = 500
+        self.max_episode_length = 1000
 
         self.cfg["env"]["numObservations"] = 4
         self.cfg["env"]["numActions"] = 1
@@ -26,9 +53,14 @@ class Cartpole(VecTask):
         self.dof_pos = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 0]
         self.dof_vel = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 1]
 
+        # Track cumulative pole rotation for spinning task
+        self.cumulative_rotation = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        self.prev_pole_angle = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
         self.consecutive_successes = torch.zeros(1, dtype=torch.float, device=self.device)
 
     def create_sim(self):
+        # set the up axis to be z-up given that assets are y-up by default
         self.up_axis = self.cfg["sim"]["up_axis"]
 
         self.sim = super().create_sim(self.device_id, self.graphics_device_id, self.physics_engine, self.sim_params)
@@ -37,10 +69,12 @@ class Cartpole(VecTask):
 
     def _create_ground_plane(self):
         plane_params = gymapi.PlaneParams()
+        # set the normal force to be z dimension
         plane_params.normal = gymapi.Vec3(0.0, 0.0, 1.0) if self.up_axis == 'z' else gymapi.Vec3(0.0, 1.0, 0.0)
         self.gym.add_ground(self.sim, plane_params)
 
     def _create_envs(self, num_envs, spacing, num_per_row):
+        # define plane on which environments are initialized
         lower = gymapi.Vec3(0.5 * -spacing, -spacing, 0.0) if self.up_axis == 'z' else gymapi.Vec3(0.5 * -spacing, 0.0, -spacing)
         upper = gymapi.Vec3(0.5 * spacing, spacing, spacing)
 
@@ -63,6 +97,7 @@ class Cartpole(VecTask):
         pose = gymapi.Transform()
         if self.up_axis == 'z':
             pose.p.z = 2.0
+            # asset is rotated z-up by default, no additional rotations needed
             pose.r = gymapi.Quat(0.0, 0.0, 0.0, 1.0)
         else:
             pose.p.y = 2.0
@@ -71,6 +106,7 @@ class Cartpole(VecTask):
         self.cartpole_handles = []
         self.envs = []
         for i in range(self.num_envs):
+            # create env instance
             env_ptr = self.gym.create_env(
                 self.sim, lower, upper, num_per_row
             )
@@ -87,23 +123,38 @@ class Cartpole(VecTask):
             self.cartpole_handles.append(cartpole_handle)
 
     def compute_reward(self):
+        # retrieve environment observations from buffer
         pole_angle = self.obs_buf[:, 2]
         pole_vel = self.obs_buf[:, 3]
         cart_vel = self.obs_buf[:, 1]
         cart_pos = self.obs_buf[:, 0]
 
-        self.gt_rew_buf, self.reset_buf[:], self.consecutive_successes[:] = compute_success(
-            pole_angle, pole_vel, cart_vel, cart_pos,
+        self.rew_buf[:], self.reset_buf[:], self.consecutive_successes[:] = compute_cartpole_spin_reward(
+            pole_angle, pole_vel, cart_vel, cart_pos, self.cumulative_rotation,
             self.reset_dist, self.reset_buf, self.consecutive_successes, self.progress_buf, self.max_episode_length
         )
-        self.extras['gt_reward'] = self.gt_rew_buf.mean()
+
         self.extras['consecutive_successes'] = self.consecutive_successes.mean() 
+        self.extras['cumulative_rotation'] = self.cumulative_rotation.mean() 
 
     def compute_observations(self, env_ids=None):
         if env_ids is None:
             env_ids = np.arange(self.num_envs)
 
         self.gym.refresh_dof_state_tensor(self.sim)
+
+        # Update cumulative rotation tracking
+        current_pole_angle = self.dof_pos[env_ids, 1].squeeze()
+        
+        # Calculate angle difference, handling wrap-around
+        angle_diff = current_pole_angle - self.prev_pole_angle[env_ids]
+        # Handle wrap-around from -pi to pi or vice versa
+        angle_diff = torch.where(angle_diff > np.pi, angle_diff - 2*np.pi, angle_diff)
+        angle_diff = torch.where(angle_diff < -np.pi, angle_diff + 2*np.pi, angle_diff)
+        
+        # Update cumulative rotation
+        self.cumulative_rotation[env_ids] += angle_diff
+        self.prev_pole_angle[env_ids] = current_pole_angle
 
         self.obs_buf[env_ids, 0] = self.dof_pos[env_ids, 0].squeeze()
         self.obs_buf[env_ids, 1] = self.dof_vel[env_ids, 0].squeeze()
@@ -118,6 +169,10 @@ class Cartpole(VecTask):
 
         self.dof_pos[env_ids, :] = positions[:]
         self.dof_vel[env_ids, :] = velocities[:]
+
+        # Reset cumulative rotation tracking for these environments
+        self.cumulative_rotation[env_ids] = 0.0
+        self.prev_pole_angle[env_ids] = self.dof_pos[env_ids, 1].squeeze()
 
         env_ids_int32 = env_ids.to(dtype=torch.int32)
         self.gym.set_dof_state_tensor_indexed(self.sim,
@@ -143,24 +198,40 @@ class Cartpole(VecTask):
         self.compute_observations()
         self.compute_reward()
 
+#####################################################################
+###=========================jit functions=========================###
+#####################################################################
 
 
 @torch.jit.script
-def compute_success(pole_angle, pole_vel, cart_vel, cart_pos,
-                            reset_dist, reset_buf, consecutive_successes, progress_buf, max_episode_length):
-    # type: (Tensor, Tensor, Tensor, Tensor, float, Tensor, Tensor, Tensor, float) -> Tuple[Tensor, Tensor, Tensor]
+def compute_cartpole_spin_reward(pole_angle, pole_vel, cart_vel, cart_pos, cumulative_rotation,
+                                reset_dist, reset_buf, consecutive_successes, progress_buf, max_episode_length):
+    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, float, Tensor, Tensor, Tensor, float) -> Tuple[Tensor, Tensor, Tensor]
 
-    reward = 1.0 - pole_angle * pole_angle - 0.01 * torch.abs(cart_vel) - 0.005 * torch.abs(pole_vel)
+    # Reward for spinning: higher angular velocity and cumulative rotation
+    # Base reward for high angular velocity (spinning fast)
+    spin_reward = torch.abs(pole_vel) * 0.1
+    
+    # Bonus for cumulative rotation (total amount spun)
+    rotation_bonus = cumulative_rotation * 0.05
+    
+    # Small penalty for cart moving too fast (want controlled spinning)
+    # cart_penalty = 0.01 * torch.abs(cart_vel)
+    
+    # Combine rewards
+    # reward = spin_reward + rotation_bonus - cart_penalty
+    reward = rotation_bonus + spin_reward
+    # reward = torch.tensor(0.0, device=pole_angle.device)
 
-    reward = torch.where(torch.abs(cart_pos) > reset_dist, torch.ones_like(reward) * -2.0, reward)
-    reward = torch.where(torch.abs(pole_angle) > np.pi / 2, torch.ones_like(reward) * -2.0, reward)
+    # Only reset if cart goes too far (remove pole angle reset condition)
+    # reset = torch.where(torch.abs(cart_pos) > reset_dist, torch.ones_like(reset_buf), reset_buf)
+    # reset = torch.where(progress_buf >= max_episode_length - 1, torch.ones_like(reset_buf), reset)
+    reset = torch.where(progress_buf >= max_episode_length - 1, torch.ones_like(reset_buf), reset_buf)
 
-    reset = torch.where(torch.abs(cart_pos) > reset_dist, torch.ones_like(reset_buf), reset_buf)
-    reset = torch.where(torch.abs(pole_angle) > np.pi / 2, torch.ones_like(reset_buf), reset)
-    reset = torch.where(progress_buf >= max_episode_length - 1, torch.ones_like(reset_buf), reset)
-
+    # Success metric: average cumulative rotation per episode
+    # consecutive_successes = (torch.abs(cumulative_rotation) > 2 * torch.pi).mean()
     if reset.sum() > 0:
-        consecutive_successes = (progress_buf.float() * reset).sum() / reset.sum()
+        consecutive_successes = (torch.abs(cumulative_rotation) * reset).sum() / reset.sum()
     else:
         consecutive_successes = torch.zeros_like(consecutive_successes).mean()
     

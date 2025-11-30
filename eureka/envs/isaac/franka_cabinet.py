@@ -520,4 +520,5 @@ def compute_success(
     reset_buf = torch.where(progress_buf >= max_episode_length - 1, torch.ones_like(reset_buf), reset_buf)
 
     consecutive_successes = torch.where(reset_buf > 0, successes * reset_buf, consecutive_successes).mean()
+
     return rewards, reset_buf, successes, consecutive_successes

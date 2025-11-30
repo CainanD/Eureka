@@ -368,7 +368,7 @@ class ShadowHand(VecTask):
         self.goal_object_indices = to_torch(self.goal_object_indices, dtype=torch.long, device=self.device)
 
     def compute_reward(self, actions):
-        self.rew_buf[:], self.rew_dict = compute_reward(self.object_pos, self.goal_pos, self.object_rot, self.goal_rot, self.object_linvel, self.object_angvel, self.actions)
+        self.rew_buf[:], self.rew_dict = compute_reward(self.base_lin_vel, self.base_ang_vel, self.base_quat, self.commands, self.actions, self.last_actions, self.dof_vel, self.contact_forces, self.base_height)
         self.extras['gpt_reward'] = self.rew_buf.mean()
         for rew_state in self.rew_dict: self.extras[rew_state] = self.rew_dict[rew_state].mean()
 
@@ -737,150 +737,148 @@ import torch
 from torch import Tensor
 @torch.jit.script
 def compute_reward(
-    object_pos: torch.Tensor,
-    goal_pos: torch.Tensor,
-    object_rot: torch.Tensor,
-    goal_rot: torch.Tensor,
-    object_linvel: torch.Tensor,
-    object_angvel: torch.Tensor,
-    actions: torch.Tensor,
+    base_lin_vel: torch.Tensor,          # self.base_lin_vel: (num_envs, 3)
+    base_ang_vel: torch.Tensor,          # self.base_ang_vel: (num_envs, 3)
+    base_quat: torch.Tensor,             # self.base_quat:     (num_envs, 4) [x, y, z, w]
+    commands: torch.Tensor,              # self.commands:      (num_envs, 3) [vx_cmd, vy_cmd, yaw_rate_cmd]
+    actions: torch.Tensor,               # self.actions:       (num_envs, num_actions)
+    last_actions: torch.Tensor,          # self.last_actions:  (num_envs, num_actions)
+    dof_vel: torch.Tensor,               # self.dof_vel:       (num_envs, num_dofs)
+    contact_forces: torch.Tensor,        # self.contact_forces:(num_envs, n_feet, 3) or (num_envs, n_feet)
+    base_height: torch.Tensor            # self.base_height:   (num_envs,)
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    # Ensure TorchScript-safe shapes and device handling
-    device = object_pos.device
+    """
+    Reward for ANYmal walking forward steadily and maintaining balance.
+    Uses only tensors that are assumed to be precomputed and stored in the environment (self.*).
+    """
+
+    device = base_lin_vel.device
     eps = torch.tensor(1e-6, device=device)
 
-    # Temperature parameters for transformed components (must be named, not inputs)
-    T_proximity = torch.tensor(1.0, device=device)  # for distance-to-goal shaping
-    T_speed = torch.tensor(1.5, device=device)      # for speed tracking shaping
+    # Temperatures for transformed components (each one is a named variable)
+    temp_lin_vel = torch.tensor(1.0, device=device)         # for linear velocity tracking exp
+    temp_ang_vel = torch.tensor(0.5, device=device)         # for yaw rate tracking exp
+    temp_upright  = torch.tensor(0.25, device=device)       # for uprightness exp
+    temp_height   = torch.tensor(0.02, device=device)       # for height tracking exp
+    temp_stability = torch.tensor(0.5, device=device)       # for lateral/vertical vel stability exp
+    temp_ang_stability = torch.tensor(0.2, device=device)   # for roll/pitch angular vel exp
+    temp_action   = torch.tensor(10.0, device=device)       # for action magnitude exp
+    temp_rate     = torch.tensor(1.0, device=device)        # for action rate exp
+    temp_dof_vel  = torch.tensor(5.0, device=device)        # for joint velocity exp
+    temp_contact  = torch.tensor(1.0, device=device)        # scale inside tanh for contact utilization
 
-    # Reward weights
-    w_proximity = 0.4
-    w_progress = 1.0
-    w_heading_goal_dir = 0.3
-    w_heading_goal_pose = 0.3
-    w_speed = 0.6
-    w_upright = 0.2
-    w_turning = 0.15
-    w_side_penalty = 0.2
-    w_angular_penalty = 0.1
-    w_action_penalty = 0.05
+    # Reference values
+    h_ref = torch.tensor(0.35, device=device)               # nominal base height (m), adjust as needed
+    contact_threshold = torch.tensor(20.0, device=device)   # N, threshold to count a foot as in contact
 
-    # Target speed (m/s)
-    speed_target = 1.0
+    # 1) Linear velocity tracking in the horizontal plane (vx, vy)
+    # Track commanded linear velocity commands[:, :2]
+    vel_xy = base_lin_vel[:, 0:2]
+    cmd_xy = commands[:, 0:2]
+    lin_vel_err_sq = torch.sum((vel_xy - cmd_xy) * (vel_xy - cmd_xy), dim=1)
+    r_lin_vel = torch.exp(-lin_vel_err_sq / (temp_lin_vel + eps))
 
-    # Vector to goal and distance
-    vec_to_goal = goal_pos - object_pos
-    dist_to_goal = torch.norm(vec_to_goal + eps, dim=1)
-    dir_to_goal = vec_to_goal / torch.clamp(dist_to_goal.unsqueeze(1), min=1e-6)
+    # 2) Angular velocity tracking around z (yaw rate)
+    yaw_err_sq = (base_ang_vel[:, 2] - commands[:, 2]) ** 2
+    r_ang_vel = torch.exp(-yaw_err_sq / (temp_ang_vel + eps))
 
-    # Base linear velocity components
-    v_along_goal = torch.sum(object_linvel * dir_to_goal, dim=1)  # progress speed along direction to goal
-    v_along_goal_positive = torch.clamp(v_along_goal, min=0.0)    # only reward moving toward goal
+    # 3) Uprightness reward: align base z-axis with world z-axis
+    # Quaternion expected as [x, y, z, w]
+    qx = base_quat[:, 0]
+    qy = base_quat[:, 1]
+    qz = base_quat[:, 2]
+    qw = base_quat[:, 3]
+    # Third column of rotation matrix (body z-axis in world frame)
+    up_x = 2.0 * (qx * qz + qw * qy)
+    up_y = 2.0 * (qy * qz - qw * qx)
+    up_z = 1.0 - 2.0 * (qx * qx + qy * qy)
+    # Encourage up_z near 1.0
+    r_upright = torch.exp(-(1.0 - up_z).clamp(min=0.0) / (temp_upright + eps))
 
-    # Distance proximity shaping
-    r_proximity = torch.exp(-dist_to_goal / torch.clamp(T_proximity, min=1e-6))
+    # 4) Base height tracking
+    height_err_sq = (base_height - h_ref) * (base_height - h_ref)
+    r_height = torch.exp(-height_err_sq / (temp_height + eps))
 
-    # Normalize quaternions
-    q_norm = torch.clamp(torch.norm(object_rot, dim=1, keepdim=True), min=1e-6)
-    qn = object_rot / q_norm
-    x = qn[:, 0]
-    y = qn[:, 1]
-    z = qn[:, 2]
-    w = qn[:, 3]
+    # 5) Stability: discourage lateral (vy) and vertical (vz) motion
+    vy = base_lin_vel[:, 1]
+    vz = base_lin_vel[:, 2]
+    stability_err = vy * vy + vz * vz
+    r_stability = torch.exp(-stability_err / (temp_stability + eps))
 
-    # Rotation basis vectors from quaternion (robot frame axes in world)
-    # Forward (x-axis), Side (y-axis), Up (z-axis)
-    forward = torch.stack([
-        1.0 - 2.0 * (y * y + z * z),
-        2.0 * (x * y + w * z),
-        2.0 * (x * z - w * y)
-    ], dim=1)
-    side = torch.stack([
-        2.0 * (x * y - w * z),
-        1.0 - 2.0 * (x * x + z * z),
-        2.0 * (y * z + w * x)
-    ], dim=1)
-    up = torch.stack([
-        2.0 * (x * z + w * y),
-        2.0 * (y * z - w * x),
-        1.0 - 2.0 * (x * x + y * y)
-    ], dim=1)
+    # 6) Angular stability: discourage roll/pitch angular velocity (wx, wy)
+    wx = base_ang_vel[:, 0]
+    wy = base_ang_vel[:, 1]
+    ang_stab_err = wx * wx + wy * wy
+    r_ang_stability = torch.exp(-ang_stab_err / (temp_ang_stability + eps))
 
-    forward_unit = forward / torch.clamp(torch.norm(forward, dim=1, keepdim=True), min=1e-6)
-    side_unit = side / torch.clamp(torch.norm(side, dim=1, keepdim=True), min=1e-6)
-    up_unit = up / torch.clamp(torch.norm(up, dim=1, keepdim=True), min=1e-6)
+    # 7) Action regularization (energy): smaller magnitudes preferred
+    act_mag = torch.sum(actions * actions, dim=1)
+    r_action = torch.exp(-act_mag / (temp_action + eps))
 
-    # Heading alignment to goal direction (for walking toward a waypoint)
-    align_to_goal_dir = torch.sum(forward_unit * dir_to_goal, dim=1)  # in [-1, 1]
-    r_heading_goal_dir = torch.clamp(0.5 * (align_to_goal_dir + 1.0), min=0.0, max=1.0)
+    # 8) Action rate regularization: smoother actions preferred
+    act_rate_mag = torch.sum((actions - last_actions) * (actions - last_actions), dim=1)
+    r_action_rate = torch.exp(-act_rate_mag / (temp_rate + eps))
 
-    # Heading alignment to goal orientation (for turning-in-place tasks)
-    # Normalize goal quaternion and get its forward vector
-    gq_norm = torch.clamp(torch.norm(goal_rot, dim=1, keepdim=True), min=1e-6)
-    gqn = goal_rot / gq_norm
-    gx = gqn[:, 0]
-    gy = gqn[:, 1]
-    gz = gqn[:, 2]
-    gw = gqn[:, 3]
-    goal_forward = torch.stack([
-        1.0 - 2.0 * (gy * gy + gz * gz),
-        2.0 * (gx * gy + gw * gz),
-        2.0 * (gx * gz - gw * gy)
-    ], dim=1)
-    goal_forward_unit = goal_forward / torch.clamp(torch.norm(goal_forward, dim=1, keepdim=True), min=1e-6)
-    align_to_goal_pose = torch.sum(forward_unit * goal_forward_unit, dim=1)  # in [-1, 1]
-    r_heading_goal_pose = torch.clamp(0.5 * (align_to_goal_pose + 1.0), min=0.0, max=1.0)
+    # 9) Joint velocity regularization: discourage excessive joint speeds
+    dof_vel_mag = torch.mean(dof_vel * dof_vel, dim=1)
+    r_dof_vel = torch.exp(-dof_vel_mag / (temp_dof_vel + eps))
 
-    # Speed tracking along the direction to goal
-    speed_err = v_along_goal - speed_target
-    r_speed_track = torch.exp(-(speed_err * speed_err) / torch.clamp(T_speed, min=1e-6))
+    # 10) Contact utilization: prefer having at least one (ideally two) feet in stance
+    # contact_forces shape may be (N, n_feet, 3) or (N, n_feet); handle both
+    last_dim = contact_forces.size(-1)
+    if last_dim == 3:
+        cf_mag = torch.sqrt(torch.sum(contact_forces * contact_forces, dim=2) + eps)  # (N, n_feet)
+    else:
+        cf_mag = torch.abs(contact_forces)  # (N, n_feet)
 
-    # Uprightness reward (encourage small roll/pitch)
-    world_up = torch.tensor([0.0, 0.0, 1.0], device=device).unsqueeze(0).expand(object_pos.shape[0], 3)
-    upright = torch.sum(up_unit * world_up, dim=1)  # in [-1, 1]
-    r_upright = torch.clamp(upright, min=0.0, max=1.0)
+    feet_in_contact = (cf_mag > contact_threshold).to(cf_mag.dtype)
+    contact_fraction = torch.mean(feet_in_contact, dim=1)  # [0..1]
+    # Shape into a smooth reward; scale by temp_contact inside tanh
+    r_contact = torch.tanh(contact_fraction / (temp_contact + eps) + contact_fraction)
 
-    # Turning reward (encourage yaw motion when pose misaligned)
-    misalign_pose = 1.0 - r_heading_goal_pose
-    yaw_rate = torch.abs(object_angvel[:, 2])
-    r_turning = yaw_rate * misalign_pose
+    # Optional: forward progress positivity (to bias towards forward motion if no command)
+    forward_progress = torch.clamp(base_lin_vel[:, 0], min=0.0)
 
-    # Sideways slip penalty (minimize lateral velocity)
-    side_speed = torch.abs(torch.sum(object_linvel * side_unit, dim=1))
-    p_side = -side_speed
+    # Weights for each component
+    w_lin_vel       = torch.tensor(1.6, device=device)
+    w_ang_vel       = torch.tensor(0.4, device=device)
+    w_upright       = torch.tensor(0.8, device=device)
+    w_height        = torch.tensor(0.2, device=device)
+    w_stability     = torch.tensor(0.5, device=device)
+    w_ang_stability = torch.tensor(0.5, device=device)
+    w_action        = torch.tensor(0.05, device=device)
+    w_action_rate   = torch.tensor(0.05, device=device)
+    w_dof_vel       = torch.tensor(0.1, device=device)
+    w_contact       = torch.tensor(0.3, device=device)
+    w_progress      = torch.tensor(0.2, device=device)
 
-    # Penalize roll/pitch angular rates
-    p_ang_non_yaw = -torch.sum(object_angvel[:, 0:2] * object_angvel[:, 0:2], dim=1)
-
-    # Action effort penalty
-    p_action = -torch.sum(actions * actions, dim=1)
-
-    # Total reward composition
-    reward = (
-        w_proximity * r_proximity +
-        w_progress * v_along_goal_positive +
-        w_heading_goal_dir * r_heading_goal_dir +
-        w_heading_goal_pose * r_heading_goal_pose +
-        w_speed * r_speed_track +
-        w_upright * r_upright +
-        w_turning * r_turning +
-        w_side_penalty * p_side +
-        w_angular_penalty * p_ang_non_yaw +
-        w_action_penalty * p_action
+    # Total reward
+    total_reward = (
+        w_lin_vel * r_lin_vel
+        + w_ang_vel * r_ang_vel
+        + w_upright * r_upright
+        + w_height * r_height
+        + w_stability * r_stability
+        + w_ang_stability * r_ang_stability
+        + w_action * r_action
+        + w_action_rate * r_action_rate
+        + w_dof_vel * r_dof_vel
+        + w_contact * r_contact
+        + w_progress * forward_progress
     )
 
-    # Components dictionary
+    # Pack components
     components: Dict[str, torch.Tensor] = {}
-    components["r_proximity"] = r_proximity
-    components["r_progress_along_goal"] = v_along_goal_positive
-    components["r_heading_goal_dir"] = r_heading_goal_dir
-    components["r_heading_goal_pose"] = r_heading_goal_pose
-    components["r_speed_track"] = r_speed_track
+    components["r_lin_vel"] = r_lin_vel
+    components["r_ang_vel"] = r_ang_vel
     components["r_upright"] = r_upright
-    components["r_turning"] = r_turning
-    components["p_side_slip"] = p_side
-    components["p_ang_non_yaw"] = p_ang_non_yaw
-    components["p_action_effort"] = p_action
-    components["reward_total"] = reward
+    components["r_height"] = r_height
+    components["r_stability"] = r_stability
+    components["r_ang_stability"] = r_ang_stability
+    components["r_action"] = r_action
+    components["r_action_rate"] = r_action_rate
+    components["r_dof_vel"] = r_dof_vel
+    components["r_contact"] = r_contact
+    components["forward_progress"] = forward_progress
 
-    return reward, components
+    return total_reward, components

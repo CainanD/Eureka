@@ -113,8 +113,6 @@ class ShadowHand(VecTask):
             print("New episode length: ", self.max_episode_length)
 
         if self.viewer != None:
-            # cam_pos = gymapi.Vec3(10.0, 5.0, 1.0)
-            # cam_target = gymapi.Vec3(6.0, 5.0, 0.0)
             cam_pos = gymapi.Vec3(0.25, -0.8, 1.05)
             cam_target = gymapi.Vec3(-0.05, -0.2, 0)
             self.gym.viewer_camera_look_at(self.viewer, None, cam_pos, cam_target)
@@ -330,6 +328,7 @@ class ShadowHand(VecTask):
             self.object_init_state.append([object_start_pose.p.x, object_start_pose.p.y, object_start_pose.p.z,
                                            object_start_pose.r.x, object_start_pose.r.y, object_start_pose.r.z, object_start_pose.r.w,
                                            0, 0, 0, 0, 0, 0])
+
             object_idx = self.gym.get_actor_index(env_ptr, object_handle, gymapi.DOMAIN_SIM)
             self.object_indices.append(object_idx)
 
@@ -354,7 +353,9 @@ class ShadowHand(VecTask):
 
         self.object_init_state = to_torch(self.object_init_state, device=self.device, dtype=torch.float).view(self.num_envs, 13)
         self.goal_states = self.object_init_state.clone()
+
         self.goal_states[:, self.up_axis_idx] -= 0.04
+
         self.goal_init_state = self.goal_states.clone()
         self.hand_start_states = to_torch(self.hand_start_states, device=self.device).view(self.num_envs, 13)
 
@@ -367,13 +368,7 @@ class ShadowHand(VecTask):
         self.goal_object_indices = to_torch(self.goal_object_indices, dtype=torch.long, device=self.device)
 
     def compute_reward(self, actions):
-        self.rew_buf[:] = compute_bonus(
-            self.rew_buf, self.reset_buf, self.reset_goal_buf, self.progress_buf, self.successes, self.consecutive_successes,
-            self.max_episode_length, self.object_pos, self.object_rot, self.goal_pos, self.goal_rot,
-            self.dist_reward_scale, self.rot_reward_scale, self.rot_eps, self.actions, self.action_penalty_scale,
-            self.success_tolerance, self.reach_goal_bonus, self.fall_dist, self.fall_penalty,
-            self.max_consecutive_successes, self.av_factor, (self.object_type == "pen")
-        )
+
         self.gt_rew_buf, self.reset_buf[:], self.reset_goal_buf[:], self.progress_buf[:], self.successes[:], self.consecutive_successes[:] = compute_success(
             self.rew_buf, self.reset_buf, self.reset_goal_buf, self.progress_buf, self.successes, self.consecutive_successes,
             self.max_episode_length, self.object_pos, self.object_rot, self.goal_pos, self.goal_rot,
@@ -381,7 +376,7 @@ class ShadowHand(VecTask):
             self.success_tolerance, self.reach_goal_bonus, self.fall_dist, self.fall_penalty,
             self.max_consecutive_successes, self.av_factor, (self.object_type == "pen")
         )
-        self.extras['gt_reward'] = self.gt_rew_buf.mean()
+        self.extras['gt_reward'] = self.gt_rew_buf.mean()      
         self.extras['consecutive_successes'] = self.consecutive_successes.mean()
 
         if self.print_success_stat:
@@ -534,7 +529,7 @@ class ShadowHand(VecTask):
         new_rot = randomize_rotation(rand_floats[:, 0], rand_floats[:, 1], self.x_unit_tensor[env_ids], self.y_unit_tensor[env_ids])
 
         self.goal_states[env_ids, 0:3] = self.goal_init_state[env_ids, 0:3]
-        self.goal_states[env_ids, 3:7] = new_rot
+        self.goal_states[env_ids, 3:7] = new_rot.float()
         self.root_state_tensor[self.goal_object_indices[env_ids], 0:3] = self.goal_states[env_ids, 0:3] + self.goal_displacement_tensor
         self.root_state_tensor[self.goal_object_indices[env_ids], 3:7] = self.goal_states[env_ids, 3:7]
         self.root_state_tensor[self.goal_object_indices[env_ids], 7:13] = torch.zeros_like(self.root_state_tensor[self.goal_object_indices[env_ids], 7:13])
@@ -732,25 +727,3 @@ def compute_success(
     cons_successes = torch.where(num_resets > 0, av_factor*finished_cons_successes/num_resets + (1.0 - av_factor)*consecutive_successes, consecutive_successes)
 
     return reward, resets, goal_resets, progress_buf, successes, cons_successes
-
-@torch.jit.script
-def compute_bonus(
-    rew_buf, reset_buf, reset_goal_buf, progress_buf, successes, consecutive_successes,
-    max_episode_length: float, object_pos, object_rot, target_pos, target_rot,
-    dist_reward_scale: float, rot_reward_scale: float, rot_eps: float,
-    actions, action_penalty_scale: float,
-    success_tolerance: float, reach_goal_bonus: float, fall_dist: float,
-    fall_penalty: float, max_consecutive_successes: int, av_factor: float, ignore_z_rot: bool
-):
-    if ignore_z_rot:
-        success_tolerance = 2.0 * success_tolerance
-
-    quat_diff = quat_mul(object_rot, quat_conjugate(target_rot))
-    rot_dist = 2.0 * torch.asin(torch.clamp(torch.norm(quat_diff[:, 0:3], p=2, dim=-1), max=1.0))
-
-    goal_resets = torch.where(torch.abs(rot_dist) <= success_tolerance, torch.ones_like(reset_goal_buf), reset_goal_buf)
-    successes = successes + goal_resets
-
-    reward = torch.where(goal_resets == 1, rew_buf + reach_goal_bonus, rew_buf)
-
-    return reward

@@ -36,6 +36,8 @@ from .factory.factory_task_insertion import FactoryTaskInsertion
 from .factory.factory_task_nut_bolt_pick import FactoryTaskNutBoltPick
 from .factory.factory_task_nut_bolt_place import FactoryTaskNutBoltPlace
 from .factory.factory_task_nut_bolt_screw import FactoryTaskNutBoltScrew
+from .franka_ball_throw import FrankaBallThrow
+from .cartpole_spin import CartpoleSpin
 from .franka_cabinet import FrankaCabinet
 from .franka_cube_stack import FrankaCubeStack
 from .humanoid import Humanoid
@@ -80,11 +82,13 @@ isaacgym_task_map = {
     "AnymalTerrain": AnymalTerrain,
     "BallBalance": BallBalance,
     "Cartpole": Cartpole,
+    "CartpoleSpin": CartpoleSpin,
     "FactoryTaskGears": FactoryTaskGears,
     "FactoryTaskInsertion": FactoryTaskInsertion,
     "FactoryTaskNutBoltPick": FactoryTaskNutBoltPick,
     "FactoryTaskNutBoltPlace": FactoryTaskNutBoltPlace,
     "FactoryTaskNutBoltScrew": FactoryTaskNutBoltScrew,
+    "FrankaBallThrow": FrankaBallThrow,
     "FrankaCabinet": FrankaCabinet,
     "FrankaCubeStack": FrankaCubeStack,
     "Humanoid": Humanoid,

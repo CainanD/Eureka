@@ -419,4 +419,5 @@ def compute_success(tray_positions, ball_positions, ball_velocities, ball_radius
         consecutive_successes = (progress_buf.float() * reset).sum() / reset.sum()
     else:
         consecutive_successes = torch.zeros_like(consecutive_successes).mean()
+    
     return reward, reset, consecutive_successes
