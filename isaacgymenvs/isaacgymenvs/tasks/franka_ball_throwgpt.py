@@ -379,7 +379,7 @@ class FrankaBallThrowGPT(VecTask):
         self._update_states()
 
     def compute_reward(self, actions):
-        self.rew_buf[:], self.rew_dict = compute_reward(self.ball_pos, self.ball_vel, self.ball_to_target)
+        self.rew_buf[:], self.rew_dict = compute_reward(self.ball_pos, self.ball_vel, self.target_pos, self.eef_pos)
         self.extras['gpt_reward'] = self.rew_buf.mean()
         for rew_state in self.rew_dict: self.extras[rew_state] = self.rew_dict[rew_state].mean()
         self.gt_rew_buf, self.reset_buf[:], self.successes[:], self.consecutive_successes[:] = compute_success(
@@ -617,60 +617,46 @@ import torch
 from torch import Tensor
 @torch.jit.script
 def compute_reward(
-    ball_pos: torch.Tensor,
-    ball_vel: torch.Tensor,
-    ball_to_target: torch.Tensor,
+    ball_pos: torch.Tensor,               # shape (N, 3)
+    ball_vel: torch.Tensor,               # shape (N, 3)
+    target_pos: torch.Tensor,             # shape (N, 3)
+    eef_pos: torch.Tensor,                # shape (N, 3)
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """
-    Improved reward function for throwing ball to hit target.
 
-    Inputs:
-    - ball_pos: (N,3) tensor of ball positions
-    - ball_vel: (N,3) tensor of ball velocities
-    - ball_to_target: (N,3) vector from ball pos to target pos
-
-    Returns:
-    - reward: (N,) tensor of scalar rewards
-    - reward_info: dict with individual reward components
-    """
     device = ball_pos.device
-    batch_size = ball_pos.shape[0]
+    # Constants (temperatures) for exponential scaling
+    dist_temp = torch.tensor(5.0, device=device)
+    throw_temp = torch.tensor(2.0, device=device)
+    control_temp = torch.tensor(1.0, device=device)
 
-    eps = 1e-8
+    # Distance from ball to target (we want to minimize this)
+    dist_ball_target = torch.norm(ball_pos - target_pos, dim=-1)  # (N,)
+    # Reward component: higher reward if ball is closer to target at end (exponential decay)
+    r_dist = torch.exp(-dist_temp * dist_ball_target)  # (N,)
 
-    # Distance to target
-    dist_to_target = torch.norm(ball_to_target, p=2, dim=1)  # (N,)
-    
-    # ---- Reward component: distance to target ----
-    # Previous version reward_dist was too small and nearly constant (~0.01-0.02),
-    # making it not helpful for learning.
-    # Adjust temperature scale to be larger to provide stronger gradient and range.
-    dist_temp = 0.05
-    reward_dist = torch.exp(-dist_to_target / dist_temp)  # [0,1], sharper decay near target
-    
-    # ---- Reward component: velocity towards target ----
-    # reward_vel showed good variation and increase over training,
-    # but might overshadow distance reward.
-    # Rescale and clip velocity reward to range [0,1].
-    ball_to_target_dir = ball_to_target / (dist_to_target.unsqueeze(1) + eps)  # unit vector toward target
-    vel_proj = torch.sum(ball_vel * ball_to_target_dir, dim=1).clamp(min=0.0)  # only positive progress
-    vel_temp = 1.0
-    reward_vel = torch.tanh(vel_proj / vel_temp)  # smooth saturating reward [0,1]
+    # Encourage ball to have sufficiently high speed at throw time to reach target
+    # We use ball velocity norm projected roughly towards the target direction
+    vec_ball_to_target = target_pos - ball_pos  # (N,3)
+    dist_ball_target_eps = dist_ball_target + 1e-6  # to avoid div0
+    dir_ball_to_target = vec_ball_to_target / dist_ball_target_eps.unsqueeze(-1)  # unit vector (N,3)
+    ball_speed_towards_target = (ball_vel * dir_ball_to_target).sum(dim=-1).clamp(min=0.0)  # (N,)
+    r_throw = torch.exp(-throw_temp / (ball_speed_towards_target + 1e-6))  # higher speed => higher reward
 
-    # ---- New Reward component: hammer hitting the target (ball within threshold dist) ----
-    # We add a sparse success reward to enable learning the hitting of the target
-    hit_threshold = 0.05  # 5 cm
-    reward_hit = (dist_to_target < hit_threshold).to(ball_pos.dtype)
+    # Penalty: keep end-effector reasonably close to ball (to encourage control and throwing)
+    dist_eef_ball = torch.norm(eef_pos - ball_pos, dim=-1)
+    r_control = torch.exp(-control_temp * dist_eef_ball)
 
-    # ---- Combine the rewards ----
-    # Weight reward_hit more to encourage actually hitting the target
-    # Also balance distance and velocity rewards
-    reward = reward_dist * 0.6 + reward_vel * 0.3 + reward_hit * 1.0
+    # Total reward as weighted sum
+    w_dist = 5.0
+    w_throw = 2.0
+    w_control = 1.0
 
-    reward_info = {
-        "reward_dist": reward_dist,
-        "reward_vel": reward_vel,
-        "reward_hit": reward_hit,
+    reward = w_dist * r_dist + w_throw * r_throw + w_control * r_control
+
+    reward_dict = {
+        "dist_to_target_reward": r_dist,
+        "throw_speed_reward": r_throw,
+        "eef_ball_proximity_reward": r_control,
     }
 
-    return reward, reward_info
+    return reward, reward_dict

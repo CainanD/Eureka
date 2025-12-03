@@ -731,6 +731,7 @@ def compute_success(
 
     return reward, resets, goal_resets, progress_buf, successes, cons_successes
 
+
 from typing import Tuple, Dict
 import math
 import torch

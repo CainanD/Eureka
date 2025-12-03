@@ -230,6 +230,7 @@ class VecTask(Env):
         self.gym.prepare_sim(self.sim)
         self.sim_initialized = True
 
+        self.camera_distance = None
         self.set_viewer()
         self.allocate_buffers()
 
@@ -237,7 +238,7 @@ class VecTask(Env):
 
     def set_viewer(self):
         """Create the viewer."""
-
+        print('Setting viewer')
         # todo: read from config
         self.enable_viewer_sync = True
         self.viewer = None
@@ -252,14 +253,15 @@ class VecTask(Env):
             self.gym.subscribe_viewer_keyboard_event(
                 self.viewer, gymapi.KEY_V, "toggle_viewer_sync")
 
+            print('Updating viewer position', flush=True)
             # set the camera position based on up axis
             sim_params = self.gym.get_sim_params(self.sim)
             if sim_params.up_axis == gymapi.UP_AXIS_Z:
-                cam_pos = gymapi.Vec3(20.0, 25.0, 3.0)
-                cam_target = gymapi.Vec3(10.0, 15.0, 0.0)
+                cam_pos = gymapi.Vec3(10, 12.5, 1.5)
+                cam_target = gymapi.Vec3(5, 7.5, 0.0)
             else:
-                cam_pos = gymapi.Vec3(20.0, 3.0, 25.0)
-                cam_target = gymapi.Vec3(10.0, 0.0, 15.0)
+                cam_pos = gymapi.Vec3(10.0, 1.5, 12.5)
+                cam_target = gymapi.Vec3(5.0, 0.0, 7.5)
 
             self.gym.viewer_camera_look_at(
                 self.viewer, None, cam_pos, cam_target)
@@ -300,9 +302,6 @@ class VecTask(Env):
         Returns:
             the Isaac Gym sim object.
         """
-        if self.cfg.get("capture_video", False):
-            self._create_camera_sensor(self.envs[0], env_idx=0)
-
         sim = _create_sim_once(self.gym, compute_device, graphics_device, physics_engine, sim_params)
         if sim is None:
             print("*** Failed to create sim")
@@ -323,7 +322,7 @@ class VecTask(Env):
         camera_handle = self.gym.create_camera_sensor(env_handle, camera_props)
         
         # Position camera to view the environment
-        cam_pos = gymapi.Vec3(3, 3, 2)
+        cam_pos = gymapi.Vec3(2.5, 2.5, 1.5)
         cam_target = gymapi.Vec3(0, 0, 0.5)
         self.gym.set_camera_location(camera_handle, env_handle, cam_pos, cam_target)
         
@@ -449,9 +448,48 @@ class VecTask(Env):
     def render(self, mode="rgb_array", env_idx=0):
         """Render a specific environment using its camera sensor"""
         if mode == "rgb_array":
+
             # If we haven't created cameras yet, create one for env_idx
             if not hasattr(self, 'cameras') or len(self.cameras) == 0:
                 self._create_camera_sensor(self.envs[env_idx], env_idx)
+            
+            env = self.envs[env_idx]
+            rigid_body_positions = []
+
+            rb_states = gymtorch.wrap_tensor(self.gym.acquire_rigid_body_state_tensor(self.sim))
+
+            num_actors = self.gym.get_actor_count(env)
+            for i in range(num_actors):
+                actor_handle = self.gym.get_actor_handle(env, i)
+                num_rigid_bodies = self.gym.get_actor_rigid_body_count(env, actor_handle)
+
+                for j in range(num_rigid_bodies):
+                    rb_index = self.gym.get_actor_rigid_body_index(env, actor_handle, j, gymapi.DOMAIN_SIM)
+                    rigid_body_positions.append([rb_states[rb_index,0], rb_states[rb_index,1], rb_states[rb_index,2]])
+
+            rigid_body_positions = torch.tensor(rigid_body_positions).to(self.device)
+            cam_target = rigid_body_positions[1]
+
+            if self.camera_distance is None:
+                max_dim = torch.max(rigid_body_positions, dim=0)[0] # torch.max returns a tuple (values, indices)
+                min_dim = torch.min(rigid_body_positions, dim=0)[0]
+
+                # Render region length is a gross approximation of how far back I need to place the camera
+                render_region_length = max(torch.linalg.norm(max_dim-min_dim).item(), 2)
+                print(f'Render Region Length: {torch.linalg.norm(max_dim-min_dim).item()}')
+                self.camera_distance = 1.5*render_region_length
+                print(f'Camera distance: {self.camera_distance}')
+
+                self.cam_direction = torch.tensor([.6, .6, .1]).to(self.device)
+
+            # Render region length is a gross approximation of how far back I need to place the camera
+            cam_pos = cam_target + self.camera_distance*self.cam_direction 
+            
+            cam_pos = cam_pos.detach().cpu().numpy()
+            cam_pos = gymapi.Vec3(cam_pos[0], cam_pos[1], cam_pos[2])
+            cam_target = cam_target.detach().cpu().numpy()
+            cam_target = gymapi.Vec3(cam_target[0], cam_target[1], cam_target[2])
+            self.gym.set_camera_location(self.cameras[0], self.envs[0], cam_pos, cam_target)
 
             if self.device != 'cpu':
                 self.gym.fetch_results(self.sim, True)

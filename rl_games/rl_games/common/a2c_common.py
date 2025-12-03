@@ -608,7 +608,16 @@ class A2CBase(BaseAlgorithm):
         if self.has_central_value:
             self.central_value_net.load_state_dict(weights['assymetric_vf_nets'])
 
-        self.optimizer.load_state_dict(weights['optimizer'])
+        # Only load optimizer state if it has valid param_groups
+        # This allows loading model weights without optimizer state (e.g., from converted checkpoints)
+        opt_state = weights.get('optimizer', {})
+        if opt_state and opt_state.get('param_groups'):
+            try:
+                self.optimizer.load_state_dict(opt_state)
+            except (ValueError, RuntimeError) as e:
+                print(f"Warning: Could not load optimizer state: {e}")
+                print("Continuing with fresh optimizer...")
+
         self.frame = weights.get('frame', 0)
         self.last_mean_rewards = weights.get('last_mean_rewards', -100500)
 

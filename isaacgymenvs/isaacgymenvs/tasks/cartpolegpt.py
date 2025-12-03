@@ -1,3 +1,7 @@
+from typing import Tuple, Dict
+import math
+import torch
+from torch import Tensor
 
 import numpy as np
 import os
@@ -95,10 +99,8 @@ class CartpoleGPT(VecTask):
         cart_vel = self.obs_buf[:, 1]
         cart_pos = self.obs_buf[:, 0]
 
-        self.gt_rew_buf, self.reset_buf[:], self.consecutive_successes[:] = compute_success(
-            pole_angle, pole_vel, cart_vel, cart_pos,
-            self.reset_dist, self.reset_buf, self.consecutive_successes, self.progress_buf, self.max_episode_length
-        )
+        self.gt_rew_buf, _ = compute_success(self.dof_pos, self.dof_vel)
+        self.consecutive_successes[:] = self.gt_rew_buf.mean()
         self.extras['gt_reward'] = self.gt_rew_buf.mean()
         self.extras['consecutive_successes'] = self.consecutive_successes.mean() 
 
@@ -146,28 +148,36 @@ class CartpoleGPT(VecTask):
         self.compute_observations()
         self.compute_reward()
 
-
-
 @torch.jit.script
-def compute_success(pole_angle, pole_vel, cart_vel, cart_pos,
-                            reset_dist, reset_buf, consecutive_successes, progress_buf, max_episode_length):
-    # type: (Tensor, Tensor, Tensor, Tensor, float, Tensor, Tensor, Tensor, float) -> Tuple[Tensor, Tensor, Tensor]
+def compute_success(dof_pos: torch.Tensor, dof_vel: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    # dof_pos: shape [num_envs, 2] -> [cart_pos, pole_angle]
+    # dof_vel: shape [num_envs, 2] -> [cart_velocity, pole_angular_velocity]
 
-    reward = 1.0 - pole_angle * pole_angle - 0.01 * torch.abs(cart_vel) - 0.005 * torch.abs(pole_vel)
+    device = dof_pos.device
 
-    reward = torch.where(torch.abs(cart_pos) > reset_dist, torch.ones_like(reward) * -2.0, reward)
-    reward = torch.where(torch.abs(pole_angle) > np.pi / 2, torch.ones_like(reward) * -2.0, reward)
-
-    reset = torch.where(torch.abs(cart_pos) > reset_dist, torch.ones_like(reset_buf), reset_buf)
-    reset = torch.where(torch.abs(pole_angle) > np.pi / 2, torch.ones_like(reset_buf), reset)
-    reset = torch.where(progress_buf >= max_episode_length - 1, torch.ones_like(reset_buf), reset)
-
-    if reset.sum() > 0:
-        consecutive_successes = (progress_buf.float() * reset).sum() / reset.sum()
-    else:
-        consecutive_successes = torch.zeros_like(consecutive_successes).mean()
+    # The goal is to keep the pole angle (dof_pos[:,1]) close to 0 (upright position).
+    # Also encourage minimal angular velocity of the pole (dof_vel[:,1]) for stability.
     
-    return reward, reset, consecutive_successes
+    pole_angle = dof_pos[:, 1]
+    pole_ang_vel = dof_vel[:, 1]
+    
+    # Reward component for pole angle: higher reward when pole angle is closer to zero
+    temp_angle = torch.tensor(0.5, device=device)
+    angle_reward = torch.exp(-temp_angle * (pole_angle ** 2))
+    
+    # Reward component for angular velocity: higher reward for smaller angular velocity
+    temp_ang_vel = torch.tensor(0.1, device=device)
+    ang_vel_reward = torch.exp(-temp_ang_vel * (pole_ang_vel ** 2))
+    
+    # Combine rewards multiplicatively to encourage both upright and stable pole
+    total_reward = angle_reward * ang_vel_reward
+    
+    reward_dict = {
+        "angle_reward": angle_reward,
+        "ang_vel_reward": ang_vel_reward,
+    }
+
+    return total_reward, reward_dict
 
 from typing import Tuple, Dict
 import math
@@ -175,34 +185,31 @@ import torch
 from torch import Tensor
 @torch.jit.script
 def compute_reward(dof_pos: torch.Tensor, dof_vel: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """
-    Compute reward for the Cartpole environment to keep the pole upright and minimize pole velocity.
-    Inputs:
-        dof_pos: tensor of shape [num_envs, 2], position of cart (0) and pole angle (1)
-        dof_vel: tensor of shape [num_envs, 2], velocity of cart (0) and pole angular velocity (1)
-    Outputs:
-        reward: tensor of shape [num_envs], total reward per environment
-        info: dict with individual reward components
-    """
+    # dof_pos: shape [num_envs, 2] -> [cart_pos, pole_angle]
+    # dof_vel: shape [num_envs, 2] -> [cart_velocity, pole_angular_velocity]
+
+    device = dof_pos.device
+
+    # The goal is to keep the pole angle (dof_pos[:,1]) close to 0 (upright position).
+    # Also encourage minimal angular velocity of the pole (dof_vel[:,1]) for stability.
+    
     pole_angle = dof_pos[:, 1]
-    pole_angular_vel = dof_vel[:, 1]
-
-    # Temperature parameters for exponential transformations
-    angle_temp = torch.tensor(1.0)
-    angular_vel_temp = torch.tensor(1.0)
-
-    # Reward component 1: Pole uprightness (angle close to zero)
-    uprightness = torch.exp(- (pole_angle ** 2) / angle_temp)
-
-    # Reward component 2: Pole angular velocity close to zero
-    stable_velocity = torch.exp(- (pole_angular_vel ** 2) / angular_vel_temp)
-
-    # Combine rewards by multiplication to encourage both objectives
-    reward = uprightness * stable_velocity
-
-    info = {
-        "uprightness": uprightness,
-        "stable_velocity": stable_velocity,
+    pole_ang_vel = dof_vel[:, 1]
+    
+    # Reward component for pole angle: higher reward when pole angle is closer to zero
+    temp_angle = torch.tensor(0.5, device=device)
+    angle_reward = torch.exp(-temp_angle * (pole_angle ** 2))
+    
+    # Reward component for angular velocity: higher reward for smaller angular velocity
+    temp_ang_vel = torch.tensor(0.1, device=device)
+    ang_vel_reward = torch.exp(-temp_ang_vel * (pole_ang_vel ** 2))
+    
+    # Combine rewards multiplicatively to encourage both upright and stable pole
+    total_reward = angle_reward * ang_vel_reward
+    
+    reward_dict = {
+        "angle_reward": angle_reward,
+        "ang_vel_reward": ang_vel_reward,
     }
 
-    return reward, info
+    return total_reward, reward_dict

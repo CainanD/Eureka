@@ -1,3 +1,7 @@
+from typing import Tuple, Dict
+import math
+import torch
+from torch import Tensor
 
 import numpy as np
 import os
@@ -9,7 +13,6 @@ from isaacgym.torch_utils import *
 
 from isaacgymenvs.utils.torch_jit_utils import *
 from isaacgymenvs.tasks.base.vec_task import VecTask
-
 
 class HumanoidGPT(VecTask):
 
@@ -184,28 +187,11 @@ class HumanoidGPT(VecTask):
         self.extremities = to_torch([5, 8], device=self.device, dtype=torch.long)
 
     def compute_reward(self, actions):
-        self.rew_buf[:], self.rew_dict = compute_reward(self.potentials, self.prev_potentials)
+        self.rew_buf[:], self.rew_dict = compute_reward(self.root_states, self.heading_vec, self.up_vec, self.potentials, self.prev_potentials, self.vec_sensor_tensor, self.actions)
         self.extras['gpt_reward'] = self.rew_buf.mean()
         for rew_state in self.rew_dict: self.extras[rew_state] = self.rew_dict[rew_state].mean()
-        self.gt_rew_buf, self.reset_buf, self.consecutive_successes[:] = compute_success(
-            self.obs_buf,
-            self.reset_buf,
-            self.consecutive_successes,
-            self.progress_buf,
-            self.actions,
-            self.up_weight,
-            self.heading_weight,
-            self.potentials,
-            self.prev_potentials,
-            self.actions_cost_scale,
-            self.energy_cost_scale,
-            self.joints_at_limit_cost_scale,
-            self.max_motor_effort,
-            self.motor_efforts,
-            self.termination_height,
-            self.death_cost,
-            self.max_episode_length
-        )
+        self.gt_rew_buf, _ = compute_success(self.root_states, self.heading_vec, self.up_vec, self.potentials, self.prev_potentials, self.vec_sensor_tensor, self.actions)
+        self.consecutive_successes[:] = self.gt_rew_buf.mean()
         self.extras['gt_reward'] = self.gt_rew_buf.mean()
         self.extras['consecutive_successes'] = self.consecutive_successes.mean()
 
@@ -285,7 +271,6 @@ class HumanoidGPT(VecTask):
 
             self.gym.add_lines(self.viewer, None, self.num_envs * 2, points, colors)
 
-
 @torch.jit.script
 def compute_humanoid_observations(obs_buf, root_states, targets, potentials, inv_start_rot, dof_pos, dof_vel,
                                   dof_force, dof_limits_lower, dof_limits_upper, dof_vel_scale,
@@ -322,88 +307,208 @@ def compute_humanoid_observations(obs_buf, root_states, targets, potentials, inv
 
     return obs, potentials, prev_potentials_new, up_vec, heading_vec
 
-
-
 @torch.jit.script
 def compute_success(
-    obs_buf,
-    reset_buf,
-    consecutive_successes,
-    progress_buf,
-    actions,
-    up_weight,
-    heading_weight,
-    potentials,
-    prev_potentials,
-    actions_cost_scale,
-    energy_cost_scale,
-    joints_at_limit_cost_scale,
-    max_motor_effort,
-    motor_efforts,
-    termination_height,
-    death_cost,
-    max_episode_length
-):
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, float, float, Tensor, Tensor, float, float, float, float, Tensor, float, float, float) -> Tuple[Tensor, Tensor, Tensor]
+    root_states: torch.Tensor,
+    heading_vec: torch.Tensor,
+    up_vec: torch.Tensor,
+    potentials: torch.Tensor,
+    prev_potentials: torch.Tensor,
+    vec_sensor_tensor: torch.Tensor,
+    actions: torch.Tensor
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    # Ensure unit heading vector for safe projections
+    heading_norm = torch.norm(heading_vec, p=2, dim=-1) + 1e-6
+    heading_unit = heading_vec / heading_norm.unsqueeze(-1)
 
-    heading_weight_tensor = torch.ones_like(obs_buf[:, 11]) * heading_weight
-    heading_reward = torch.where(obs_buf[:, 11] > 0.8, heading_weight_tensor, heading_weight * obs_buf[:, 11] / 0.8)
+    # Extract COM/world velocity
+    velocity = root_states[:, 7:10]
 
-    up_reward = torch.zeros_like(heading_reward)
-    up_reward = torch.where(obs_buf[:, 10] > 0.93, up_reward + up_weight, up_reward)
+    # Forward speed along the heading direction
+    forward_speed = torch.sum(velocity * heading_unit, dim=-1)
 
-    actions_cost = torch.sum(actions ** 2, dim=-1)
+    # Lateral speed (perpendicular to heading)
+    v_perp = velocity - forward_speed.unsqueeze(-1) * heading_unit
+    lateral_speed = torch.norm(v_perp, p=2, dim=-1)
 
-    motor_effort_ratio = motor_efforts / max_motor_effort
-    scaled_cost = joints_at_limit_cost_scale * (torch.abs(obs_buf[:, 12:33]) - 0.98) / 0.02
-    dof_at_limit_cost = torch.sum((torch.abs(obs_buf[:, 12:33]) > 0.98) * scaled_cost * motor_effort_ratio.unsqueeze(0), dim=-1)
+    # Uprightness from up vector (projection onto world up z-axis)
+    up_proj = up_vec[:, 2]
 
-    electricity_cost = torch.sum(torch.abs(actions * obs_buf[:, 33:54]) * motor_effort_ratio.unsqueeze(0), dim=-1)
+    # Contact force magnitude aggregation over all sensors/axes
+    abs_sft = torch.abs(vec_sensor_tensor)
+    if abs_sft.dim() == 2:
+        # Shape: (num_envs, K)
+        contact_force_mag = torch.sum(abs_sft, dim=1)
+    elif abs_sft.dim() == 3:
+        # Shape: (num_envs, num_sensors, 6)
+        contact_force_mag = torch.sum(abs_sft, dim=2)
+        contact_force_mag = torch.sum(contact_force_mag, dim=1)
+    else:
+        # Fallback: flatten non-batch dims
+        contact_force_mag = abs_sft.view(abs_sft.size(0), -1).sum(dim=1)
 
-    alive_reward = torch.ones_like(potentials) * 2.0
-    progress_reward = potentials - prev_potentials
+    # Temperature parameters for transformed components (per requirement)
+    temp_progress = torch.tensor(1.0, device=potentials.device)
+    temp_speed = torch.tensor(1.5, device=root_states.device)
+    temp_lateral = torch.tensor(1.0, device=root_states.device)
+    temp_upright = torch.tensor(0.25, device=up_vec.device)
+    temp_contact = torch.tensor(300.0, device=vec_sensor_tensor.device)
+    temp_action = torch.tensor(0.5, device=actions.device)
 
-    total_reward = progress_reward + alive_reward + up_reward + heading_reward - \
-        actions_cost_scale * actions_cost - energy_cost_scale * electricity_cost - dof_at_limit_cost
+    # Component computations with transformations
+    # Progress: change in potential (positive when moving toward target)
+    delta_progress = potentials - prev_potentials
+    progress_raw = torch.exp(delta_progress / (temp_progress + 1e-6)) - 1.0
+    progress_raw = torch.clamp(progress_raw, min=-1.0, max=1.0)
 
-    total_reward = torch.where(obs_buf[:, 0] < termination_height, torch.ones_like(total_reward) * death_cost, total_reward)
+    # Forward speed: encourage strong forward motion; only positive contribution
+    speed_raw = torch.tanh(forward_speed / (temp_speed + 1e-6))
+    speed_raw = torch.clamp(speed_raw, min=0.0, max=1.0)
 
-    consecutive_successes = progress_reward.mean()
-    reset = torch.where(obs_buf[:, 0] < termination_height, torch.ones_like(reset_buf), reset_buf)
-    reset = torch.where(progress_buf >= max_episode_length - 1, torch.ones_like(reset_buf), reset)
+    # Lateral penalty: discourage sideways motion
+    lateral_penalty_raw = torch.tanh(lateral_speed / (temp_lateral + 1e-6))
 
-    return total_reward, reset, consecutive_successes
+    # Uprightness: keep torso upright
+    upright_raw = torch.exp((up_proj - 1.0) / (temp_upright + 1e-6))
+    upright_raw = torch.clamp(upright_raw, min=0.0, max=1.0)
+
+    # Contact force reward: encourage strong ground reaction forces while moving forward
+    contact_raw = torch.tanh(contact_force_mag / (temp_contact + 1e-6)) * speed_raw
+
+    # Action penalty: discourage excessively large actions while still allowing power
+    action_mag = torch.norm(actions, p=2, dim=-1)
+    action_penalty_raw = torch.tanh(action_mag / (temp_action + 1e-6))
+
+    # Weights for combining components
+    w_progress = torch.tensor(1.0, device=potentials.device)
+    w_speed = torch.tensor(2.5, device=potentials.device)
+    w_upright = torch.tensor(0.5, device=potentials.device)
+    w_lateral = torch.tensor(0.5, device=potentials.device)  # penalty (negative contribution)
+    w_contact = torch.tensor(0.3, device=potentials.device)
+    w_action = torch.tensor(0.05, device=potentials.device)  # penalty (negative contribution)
+
+    # Weighted components
+    progress = w_progress * progress_raw
+    speed = w_speed * speed_raw
+    upright = w_upright * upright_raw
+    lateral_penalty = -w_lateral * lateral_penalty_raw
+    contact = w_contact * contact_raw
+    action_penalty = -w_action * action_penalty_raw
+
+    # Total reward
+    total_reward = progress + speed + upright + lateral_penalty + contact + action_penalty
+
+    components: Dict[str, torch.Tensor] = {
+        "progress": progress,
+        "speed": speed,
+        "upright": upright,
+        "lateral_penalty": lateral_penalty,
+        "contact": contact,
+        "action_penalty": action_penalty,
+    }
+    return total_reward, components
 
 from typing import Tuple, Dict
 import math
 import torch
 from torch import Tensor
 @torch.jit.script
-def compute_reward(potentials: torch.Tensor, prev_potentials: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """
-    Reward function to encourage the humanoid to run as fast as possible.
+def compute_reward(
+    root_states: torch.Tensor,
+    heading_vec: torch.Tensor,
+    up_vec: torch.Tensor,
+    potentials: torch.Tensor,
+    prev_potentials: torch.Tensor,
+    vec_sensor_tensor: torch.Tensor,
+    actions: torch.Tensor
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    # Ensure unit heading vector for safe projections
+    heading_norm = torch.norm(heading_vec, p=2, dim=-1) + 1e-6
+    heading_unit = heading_vec / heading_norm.unsqueeze(-1)
 
-    Inputs:
-    - potentials: current potentials tensor (negative distance to target scaled by time step)
-    - prev_potentials: previous potentials tensor
+    # Extract COM/world velocity
+    velocity = root_states[:, 7:10]
 
-    Returns:
-    - total_reward: tensor of rewards for each environment instance
-    - rewards_dict: dictionary with individual reward components
-    """
-    # Reward for forward progress is difference in potentials (positive if closer to target)
-    forward_progress = potentials - prev_potentials  # shape: (num_envs,)
-    
-    # Temperature parameter to scale the forward progress reward smoothly
-    forward_progress_temp = 5.0
-    
-    # Transform forward progress reward with exp for better scaling and stability
-    reward_forward = torch.exp(forward_progress * forward_progress_temp) - 1.0  # nonlinear shaping
-    
-    # Total reward is just forward progress here
-    total_reward = reward_forward
-    
-    rewards_dict = {
-        "reward_forward_progress": reward_forward,
+    # Forward speed along the heading direction
+    forward_speed = torch.sum(velocity * heading_unit, dim=-1)
+
+    # Lateral speed (perpendicular to heading)
+    v_perp = velocity - forward_speed.unsqueeze(-1) * heading_unit
+    lateral_speed = torch.norm(v_perp, p=2, dim=-1)
+
+    # Uprightness from up vector (projection onto world up z-axis)
+    up_proj = up_vec[:, 2]
+
+    # Contact force magnitude aggregation over all sensors/axes
+    abs_sft = torch.abs(vec_sensor_tensor)
+    if abs_sft.dim() == 2:
+        # Shape: (num_envs, K)
+        contact_force_mag = torch.sum(abs_sft, dim=1)
+    elif abs_sft.dim() == 3:
+        # Shape: (num_envs, num_sensors, 6)
+        contact_force_mag = torch.sum(abs_sft, dim=2)
+        contact_force_mag = torch.sum(contact_force_mag, dim=1)
+    else:
+        # Fallback: flatten non-batch dims
+        contact_force_mag = abs_sft.view(abs_sft.size(0), -1).sum(dim=1)
+
+    # Temperature parameters for transformed components (per requirement)
+    temp_progress = torch.tensor(1.0, device=potentials.device)
+    temp_speed = torch.tensor(1.5, device=root_states.device)
+    temp_lateral = torch.tensor(1.0, device=root_states.device)
+    temp_upright = torch.tensor(0.25, device=up_vec.device)
+    temp_contact = torch.tensor(300.0, device=vec_sensor_tensor.device)
+    temp_action = torch.tensor(0.5, device=actions.device)
+
+    # Component computations with transformations
+    # Progress: change in potential (positive when moving toward target)
+    delta_progress = potentials - prev_potentials
+    progress_raw = torch.exp(delta_progress / (temp_progress + 1e-6)) - 1.0
+    progress_raw = torch.clamp(progress_raw, min=-1.0, max=1.0)
+
+    # Forward speed: encourage strong forward motion; only positive contribution
+    speed_raw = torch.tanh(forward_speed / (temp_speed + 1e-6))
+    speed_raw = torch.clamp(speed_raw, min=0.0, max=1.0)
+
+    # Lateral penalty: discourage sideways motion
+    lateral_penalty_raw = torch.tanh(lateral_speed / (temp_lateral + 1e-6))
+
+    # Uprightness: keep torso upright
+    upright_raw = torch.exp((up_proj - 1.0) / (temp_upright + 1e-6))
+    upright_raw = torch.clamp(upright_raw, min=0.0, max=1.0)
+
+    # Contact force reward: encourage strong ground reaction forces while moving forward
+    contact_raw = torch.tanh(contact_force_mag / (temp_contact + 1e-6)) * speed_raw
+
+    # Action penalty: discourage excessively large actions while still allowing power
+    action_mag = torch.norm(actions, p=2, dim=-1)
+    action_penalty_raw = torch.tanh(action_mag / (temp_action + 1e-6))
+
+    # Weights for combining components
+    w_progress = torch.tensor(1.0, device=potentials.device)
+    w_speed = torch.tensor(2.5, device=potentials.device)
+    w_upright = torch.tensor(0.5, device=potentials.device)
+    w_lateral = torch.tensor(0.5, device=potentials.device)  # penalty (negative contribution)
+    w_contact = torch.tensor(0.3, device=potentials.device)
+    w_action = torch.tensor(0.05, device=potentials.device)  # penalty (negative contribution)
+
+    # Weighted components
+    progress = w_progress * progress_raw
+    speed = w_speed * speed_raw
+    upright = w_upright * upright_raw
+    lateral_penalty = -w_lateral * lateral_penalty_raw
+    contact = w_contact * contact_raw
+    action_penalty = -w_action * action_penalty_raw
+
+    # Total reward
+    total_reward = progress + speed + upright + lateral_penalty + contact + action_penalty
+
+    components: Dict[str, torch.Tensor] = {
+        "progress": progress,
+        "speed": speed,
+        "upright": upright,
+        "lateral_penalty": lateral_penalty,
+        "contact": contact,
+        "action_penalty": action_penalty,
     }
-    return total_reward, rewards_dict
+    return total_reward, components

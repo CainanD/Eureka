@@ -1,3 +1,7 @@
+from typing import Tuple, Dict
+import math
+import torch
+from torch import Tensor
 
 import numpy as np
 import os
@@ -10,7 +14,6 @@ from isaacgym.torch_utils import *
 from isaacgymenvs.tasks.base.vec_task import VecTask
 
 from typing import Tuple, Dict
-
 
 class AnymalGPT(VecTask):
 
@@ -117,7 +120,6 @@ class AnymalGPT(VecTask):
         if self.randomize:
             self.apply_randomizations(self.randomization_params)
 
-
     def _create_ground_plane(self):
         plane_params = gymapi.PlaneParams()
         plane_params.normal = gymapi.Vec3(0.0, 0.0, 1.0)
@@ -200,21 +202,11 @@ class AnymalGPT(VecTask):
         self.compute_reward(self.actions)
 
     def compute_reward(self, actions):
-        self.rew_buf[:], self.rew_dict = quat_rotate_inverse(self.q, self.v)
+        self.rew_buf[:], self.rew_dict = compute_reward(self.root_states, self.commands, self.default_dof_pos, self.dof_pos, self.dof_vel, self.gravity_vec, self.actions, self.lin_vel_scale, self.ang_vel_scale, self.dof_pos_scale, self.dof_vel_scale)
         self.extras['gpt_reward'] = self.rew_buf.mean()
         for rew_state in self.rew_dict: self.extras[rew_state] = self.rew_dict[rew_state].mean()
-        self.gt_rew_buf, self.reset_buf[:], self.consecutive_successes[:] = compute_success(
-            self.root_states,
-            self.commands,
-            self.torques,
-            self.contact_forces,
-            self.knee_indices,
-            self.consecutive_successes,
-            self.progress_buf,
-            self.rew_scales,
-            self.base_index,
-            self.max_episode_length,
-        )
+        self.gt_rew_buf, _ = compute_success(self.root_states, self.commands, self.dof_pos, self.default_dof_pos, self.dof_vel, self.gravity_vec, self.actions)
+        self.consecutive_successes[:] = self.gt_rew_buf.mean()
         self.extras['gt_reward'] = self.gt_rew_buf.mean()
         self.extras['consecutive_successes'] = self.consecutive_successes.mean() 
 
@@ -299,50 +291,214 @@ def compute_anymal_observations(root_states,
 
     return obs
 
-
-
 @torch.jit.script
 def compute_success(
-    root_states,
-    commands,
-    torques,
-    contact_forces,
-    knee_indices,
-    consecutive_successes,
-    episode_lengths,
-    rew_scales,
-    base_index,
-    max_episode_length
-):
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict[str, float], int, int) -> Tuple[Tensor, Tensor, Tensor]
+    root_states: torch.Tensor,
+    commands: torch.Tensor,
+    dof_pos: torch.Tensor,
+    default_dof_pos: torch.Tensor,
+    dof_vel: torch.Tensor,
+    gravity_vec: torch.Tensor,
+    actions: torch.Tensor
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    # Temperatures for transformed components (each component has its own temperature)
+    temp_vx = 2.0
+    temp_vy = 2.0
+    temp_yaw = 1.5
+    temp_upright = 8.0
+    temp_posture = 0.4
+    temp_joint_vel = 0.08
+    temp_action = 0.04
+    temp_stable_rate = 0.5
+
+    # Weights for each component
+    w_vx = 3.0
+    w_vy = 1.0
+    w_yaw = 1.0
+    w_upright = 1.5
+    w_posture = 0.35
+    w_joint_vel = 0.25
+    w_action = 0.05
+    w_stable_rate = 0.8
+    w_forward = 0.5
 
     base_quat = root_states[:, 3:7]
-    base_lin_vel = quat_rotate_inverse(base_quat, root_states[:, 7:10])
-    base_ang_vel = quat_rotate_inverse(base_quat, root_states[:, 10:13])
+    base_lin_vel_world = root_states[:, 7:10]
+    base_ang_vel_world = root_states[:, 10:13]
 
-    lin_vel_error = torch.sum(torch.square(commands[:, :2] - base_lin_vel[:, :2]), dim=1)
-    ang_vel_error = torch.square(commands[:, 2] - base_ang_vel[:, 2])
-    rew_lin_vel_xy = torch.exp(-lin_vel_error/0.25) * rew_scales["lin_vel_xy"]
-    rew_ang_vel_z = torch.exp(-ang_vel_error/0.25) * rew_scales["ang_vel_z"]
+    # Express base velocities in the robot's body frame for meaningful tracking against commands
+    base_lin_vel_body = quat_rotate_inverse(base_quat, base_lin_vel_world)
+    base_ang_vel_body = quat_rotate_inverse(base_quat, base_ang_vel_world)
 
-    rew_torque = torch.sum(torch.square(torques), dim=1) * rew_scales["torque"]
+    # Gravity projected into body frame; upright when x,y components ~ 0 and z ~ -|g|
+    projected_gravity = quat_rotate(base_quat, gravity_vec)
 
-    total_reward = rew_lin_vel_xy + rew_ang_vel_z + rew_torque
-    total_reward = torch.clip(total_reward, 0., None)
-    reset = torch.norm(contact_forces[:, base_index, :], dim=1) > 1.
-    reset = reset | torch.any(torch.norm(contact_forces[:, knee_indices, :], dim=2) > 1., dim=1)
-    time_out = episode_lengths >= max_episode_length - 1  # no terminal reward for time-outs
-    reset = reset | time_out
-    
-    consecutive_successes = -(lin_vel_error + ang_vel_error).mean()
+    # Velocity tracking rewards (encourage cautious forward walking and minimal lateral slip)
+    vx_err = base_lin_vel_body[:, 0] - commands[:, 0]
+    vy_err = base_lin_vel_body[:, 1] - commands[:, 1]
+    yaw_err = base_ang_vel_body[:, 2] - commands[:, 2]
 
-    return total_reward.detach(), reset, consecutive_successes
+    r_vx = torch.exp(-temp_vx * (vx_err * vx_err))
+    r_vy = torch.exp(-temp_vy * (vy_err * vy_err))
+    r_yaw = torch.exp(-temp_yaw * (yaw_err * yaw_err))
+
+    # Uprightness: penalize tilt magnitude via gravity x/y components in body frame
+    tilt_mag = projected_gravity[:, 0] * projected_gravity[:, 0] + projected_gravity[:, 1] * projected_gravity[:, 1]
+    r_upright = torch.exp(-temp_upright * tilt_mag)
+
+    # Posture regularization: keep joints near nominal positions
+    pos_err = dof_pos - default_dof_pos
+    pos_err_mag = torch.mean(torch.abs(pos_err), dim=1)
+    r_posture = torch.exp(-temp_posture * pos_err_mag)
+
+    # Joint velocity regularization: discourage fast/sudden joint motions (cautious gait)
+    joint_vel_mag = torch.mean(torch.abs(dof_vel), dim=1)
+    r_joint_vel = torch.exp(-temp_joint_vel * joint_vel_mag)
+
+    # Action magnitude regularization: small efforts promote cautious behavior
+    action_mag = torch.mean(torch.abs(actions), dim=1)
+    r_action_smooth = torch.exp(-temp_action * action_mag)
+
+    # Stability via low roll/pitch angular rates
+    rp_rate_mag = base_ang_vel_body[:, 0] * base_ang_vel_body[:, 0] + base_ang_vel_body[:, 1] * base_ang_vel_body[:, 1]
+    r_stable_rate = torch.exp(-temp_stable_rate * rp_rate_mag)
+
+    # Forward progress bonus (only reward non-negative forward body-frame speed)
+    r_forward = torch.clamp(base_lin_vel_body[:, 0], min=0.0)
+
+    # Total reward
+    reward = (
+        w_vx * r_vx +
+        w_vy * r_vy +
+        w_yaw * r_yaw +
+        w_upright * r_upright +
+        w_posture * r_posture +
+        w_joint_vel * r_joint_vel +
+        w_action * r_action_smooth +
+        w_stable_rate * r_stable_rate +
+        w_forward * r_forward
+    )
+
+    components: Dict[str, torch.Tensor] = {
+        "r_vx": r_vx,
+        "r_vy": r_vy,
+        "r_yaw": r_yaw,
+        "r_upright": r_upright,
+        "r_posture": r_posture,
+        "r_joint_vel": r_joint_vel,
+        "r_action_smooth": r_action_smooth,
+        "r_stable_rate": r_stable_rate,
+        "r_forward": r_forward,
+    }
+
+    return reward, components
 
 from typing import Tuple, Dict
 import math
 import torch
 from torch import Tensor
 @torch.jit.script
-def quat_rotate_inverse(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    # rotate v by inverse of quaternion q
-    return quat_rotate(quat_conjugate(q), v)
+def compute_reward(
+    root_states: torch.Tensor,
+    commands: torch.Tensor,
+    default_dof_pos: torch.Tensor,
+    dof_pos: torch.Tensor,
+    dof_vel: torch.Tensor,
+    gravity_vec: torch.Tensor,
+    actions: torch.Tensor,
+    lin_vel_scale: float,
+    ang_vel_scale: float,
+    dof_pos_scale: float,
+    dof_vel_scale: float
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    # Extract base orientation and velocities (world) and transform to base frame, consistent with observations
+    base_quat = root_states[:, 3:7]
+    base_lin_vel = quat_rotate_inverse(base_quat, root_states[:, 7:10]) * lin_vel_scale
+    base_ang_vel = quat_rotate_inverse(base_quat, root_states[:, 10:13]) * ang_vel_scale
+    projected_gravity = quat_rotate(base_quat, gravity_vec)
+
+    # Desired (commanded) velocities, scaled like in observations
+    desired_lin_vel_x = commands[:, 0] * lin_vel_scale
+    desired_lin_vel_y = commands[:, 1] * lin_vel_scale
+    desired_yaw_rate = commands[:, 2] * ang_vel_scale
+
+    # Scaled joint states
+    dof_pos_scaled = (dof_pos - default_dof_pos) * dof_pos_scale
+    dof_vel_scaled = dof_vel * dof_vel_scale
+
+    # Temperatures for exponential shaping (each component has its own temperature)
+    temp_vx_track = 0.6
+    temp_vy_stability = 0.4
+    temp_yaw_track = 0.6
+    temp_upright = 0.2
+    temp_dof_vel = 0.8
+    temp_posture = 1.2
+    temp_actions = 0.8
+
+    # Forward velocity tracking reward (cautious tracking of commanded forward speed)
+    vx_error = torch.abs(base_lin_vel[:, 0] - desired_lin_vel_x)
+    r_vx_track = torch.exp(-vx_error / temp_vx_track)
+
+    # Encourage moving forward (non-negative body x velocity), softly
+    vx_positive = torch.clamp(base_lin_vel[:, 0], min=0.0)
+
+    # Lateral stability: discourage sideways motion (body y velocity)
+    vy_mag = torch.abs(base_lin_vel[:, 1])
+    r_vy_stability = torch.exp(-vy_mag / temp_vy_stability)
+
+    # Yaw rate tracking (keep heading changes small unless commanded)
+    yaw_error = torch.abs(base_ang_vel[:, 2] - desired_yaw_rate)
+    r_yaw_track = torch.exp(-yaw_error / temp_yaw_track)
+
+    # Uprightness: penalize tilt (horizontal components of gravity in base frame)
+    tilt_mag = torch.sqrt(projected_gravity[:, 0] * projected_gravity[:, 0] +
+                          projected_gravity[:, 1] * projected_gravity[:, 1] + 1e-8)
+    r_upright = torch.exp(-tilt_mag / temp_upright)
+
+    # Cautious stepping: keep joint velocities moderate
+    dof_vel_mean_abs = torch.mean(torch.abs(dof_vel_scaled), dim=1)
+    r_smooth_joints = torch.exp(-dof_vel_mean_abs / temp_dof_vel)
+
+    # Conservative posture: limit deviation from neutral stance (but not too strongly)
+    dof_pos_mean_abs = torch.mean(torch.abs(dof_pos_scaled), dim=1)
+    r_posture = torch.exp(-dof_pos_mean_abs / temp_posture)
+
+    # Action smoothness: discourage large action magnitudes
+    actions_mean_abs = torch.mean(torch.abs(actions), dim=1)
+    r_action_smooth = torch.exp(-actions_mean_abs / temp_actions)
+
+    # Weights for combining components
+    w_vx_track = 2.0
+    w_vx_positive = 0.5
+    w_vy_stability = 1.0
+    w_yaw_track = 1.0
+    w_upright = 1.5
+    w_smooth_joints = 0.4
+    w_posture = 0.3
+    w_action_smooth = 0.3
+
+    # Combine into total reward
+    total_reward = (
+        w_vx_track * r_vx_track +
+        w_vx_positive * vx_positive +
+        w_vy_stability * r_vy_stability +
+        w_yaw_track * r_yaw_track +
+        w_upright * r_upright +
+        w_smooth_joints * r_smooth_joints +
+        w_posture * r_posture +
+        w_action_smooth * r_action_smooth
+    )
+
+    # Assemble components dictionary
+    components = torch.jit.annotate(Dict[str, torch.Tensor], {})
+    components["r_vx_track"] = r_vx_track
+    components["vx_positive"] = vx_positive
+    components["r_vy_stability"] = r_vy_stability
+    components["r_yaw_track"] = r_yaw_track
+    components["r_upright"] = r_upright
+    components["r_smooth_joints"] = r_smooth_joints
+    components["r_posture"] = r_posture
+    components["r_action_smooth"] = r_action_smooth
+    components["total_reward"] = total_reward
+
+    return total_reward, components

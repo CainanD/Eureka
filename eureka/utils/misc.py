@@ -2,6 +2,10 @@ import subprocess
 import os
 import json
 import logging
+import os
+import re
+from pathlib import Path
+import cv2
 
 from utils.extract_task_code import file_to_string
 
@@ -40,6 +44,25 @@ def block_until_training(rl_filepath, log_status=False, iter_num=-1, response_id
             if log_status and "Traceback" in rl_log:
                 logging.info(f"Iteration {iter_num}: Code Run {response_id} execution error!")
             break
+
+
+def get_vlm_feedback(task_description, video_dir:Path, output_video_path:Path):
+
+    try:
+        result = subprocess.run(
+            ['conda', 'run', '-n', 'base', 'python', 'utils/vlm_evaluation.py', str(task_description), str(video_dir), str(output_video_path)],
+            cwd='/home/ttr/Eureka-VLM/Eureka/eureka',
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        print(f"Exit code: {e.returncode}")
+        print(f"Stdout: {e.stdout}")
+        print(f"Stderr: {e.stderr}")
+        
+        return ""
 
 if __name__ == "__main__":
     print(get_freest_gpu())
