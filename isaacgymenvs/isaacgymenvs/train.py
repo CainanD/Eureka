@@ -142,10 +142,9 @@ def launch_rlg_hydra(cfg: DictConfig):
                     envs,
                     f"videos/{run_name}",
                     episode_trigger=lambda step: (
-                        step % cfg.capture_video_freq == 0 or 
-                        step % cfg.capture_video_freq == 1)
-                    #step_trigger=lambda step: (step % cfg.capture_video_freq == 0) and (step > 0),
-                    #video_length=cfg.capture_video_len,
+                        step % cfg.capture_video_freq == 0 or
+                        step % cfg.capture_video_freq == 1),
+                    video_length=cfg.capture_video_len,  # ~20 seconds at 60fps with default 1200
                 )
         else:
             print("!!!!!video not captured!!!!!")

@@ -185,7 +185,7 @@ class AntGPT(VecTask):
         self.rew_buf[:], self.rew_dict = compute_reward(self.root_states, self.potentials, self.prev_potentials, self.dt)
         self.extras['gpt_reward'] = self.rew_buf.mean()
         for rew_state in self.rew_dict: self.extras[rew_state] = self.rew_dict[rew_state].mean()
-        self.gt_rew_buf, _ = compute_success(self.root_states, self.prev_potentials, self.potentials, self.velocities, self.up_vec, self.heading_vec, self.contact_force_scale)
+        self.gt_rew_buf, _ = compute_success(self.root_states, self.potentials, self.prev_potentials, self.dt)
         self.consecutive_successes[:] = self.gt_rew_buf.mean()
         self.extras['gt_reward'] = self.gt_rew_buf.mean()
         self.extras['consecutive_successes'] = self.consecutive_successes.mean()
@@ -303,113 +303,95 @@ def compute_ant_observations(obs_buf, root_states, targets, potentials,
     return obs, potentials, prev_potentials_new, up_vec, heading_vec
 
 @torch.jit.script
-def compute_success(root_states: torch.Tensor,
-                   prev_potentials: torch.Tensor,
-                   potentials: torch.Tensor,
-                   velocities: torch.Tensor,
-                   up_vec: torch.Tensor,
-                   heading_vec: torch.Tensor,
-                   contact_force_scale: float) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """
-    Reward function encouraging the ant to walk forward quickly.
+def compute_success(
+    root_states: torch.Tensor,  # (num_envs, 13)
+    potentials: torch.Tensor,   # (num_envs,)
+    prev_potentials: torch.Tensor,  # (num_envs,)
+    dt: float
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    # Reward component 1: forward progress reward based on increase in potentials
+    # potentials are negative distance to target / dt, so higher potentials mean closer
+    # difference potentials reward progress toward goal
+    progress = potentials - prev_potentials  # (num_envs,)
 
-    Inputs:
-    - root_states: tensor of shape (N, 13) containing root state info:
-        positions (0:3), rotations (3:7), linear velocity (7:10), angular velocity (10:13)
-    - prev_potentials: tensor of shape (N,) previous potentials (negative distance/time)
-    - potentials: tensor of shape (N,) current potentials (negative distance/time)
-    - velocities: tensor of shape (N, 3), linear velocities extracted from root_states[:,7:10]
-    - up_vec: tensor of shape (N, 3) - up direction vector of the ant
-    - heading_vec: tensor of shape (N, 3) - forward heading vector of the ant
-    - contact_force_scale: float scalar to scale contact forces (for force penalty, here unused)
+    # Reward component 2: encourage slow forward velocity along the x-axis (assumed forward)
+    # Use linear velocity x component (root_states[:, 7]) to encourage slow forward walking
+    forward_vel = root_states[:, 7]  # linear velocity x component
+    # We'll encourage forward velocity near 0.5 without going too fast
+    # Define a temperature for Gaussian shaping of velocity reward (close to 0.5)
+    temp_vel = 0.1
+    target_vel = 0.5
+    vel_reward = torch.exp(-((forward_vel - target_vel) ** 2) / (2 * temp_vel ** 2))
 
-    Returns:
-    - total reward tensor of shape (N,)
-    - dictionary of reward components
-    """
+    # Reward component 3: encourage upright stance by dotting up vector with world Z-axis (0,0,1)
+    # We don't get the up_vec here, but can compute approx from root_states quaternion
+    # Alternatively, encourage low angular velocity to keep stable orientation
+    ang_vel = root_states[:, 10:13]
+    ang_vel_norm = torch.norm(ang_vel, dim=-1)
+    # Penalize large angular velocity (rotation)
+    temp_angvel = 0.1
+    stability_reward = torch.exp(- (ang_vel_norm ** 2) / (2 * temp_angvel ** 2))
 
-    device = root_states.device
+    # Combine rewards linearly with weights
+    w_progress = 3.0
+    w_vel = 2.0
+    w_stability = 1.0
 
-    # 1. Forward progress reward: increase in "potential" (negative distance/time)
-    # potential is negative distance / dt, higher is better (less distance to goal)
-    # so potential - prev_potential > 0 means progress forward
-    reward_forward = potentials - prev_potentials  # shape (N,)
+    total_reward = w_progress * progress + w_vel * vel_reward + w_stability * stability_reward
 
-    # Temperature for forward progress scaling in exp
-    temp_forward = 10.0
-    reward_forward_exp = torch.exp(temp_forward * reward_forward) - 1.0  # normalize, zero-centered
-
-    # 2. Velocity alignment reward: project velocity onto heading vector (encourage forward velocity)
-    vel_forward = torch.sum(velocities * heading_vec, dim=-1)  # shape (N,)
-    # Reward positive forward velocity only
-    reward_vel = torch.clamp(vel_forward, min=0.0)
-    temp_vel = 2.5
-    reward_vel_exp = torch.tanh(temp_vel * reward_vel)
-
-    # 3. Upright reward: encourage up vector to align with global up (assumed [0,0,1])
-    global_up = torch.tensor([0.0, 0.0, 1.0], device=device)
-    cos_up = torch.sum(up_vec * global_up.view(1, 3), dim=-1)  # cosine similarity
-    # Reward close to upright posture
-    temp_up = 5.0
-    reward_upright = torch.exp(temp_up * (cos_up - 1.0))  # max 1 when cos_up=1, decays otherwise
-
-    # Optionally: small penalty on contact forces to encourage smooth walking
-    # But contact forces tensor is not accessible here; omit for simplicity
-
-    # Combine rewards with weights
-    w_forward = 1.0
-    w_vel = 0.5
-    w_upright = 0.3
-
-    total_reward = w_forward * reward_forward_exp + w_vel * reward_vel_exp + w_upright * reward_upright
-
-    rewards_dict = {
-        "reward_forward": reward_forward_exp,
-        "reward_velocity": reward_vel_exp,
-        "reward_upright": reward_upright,
+    reward_info = {
+        "progress": progress,
+        "vel_reward": vel_reward,
+        "stability_reward": stability_reward,
     }
 
-    return total_reward, rewards_dict
+    return total_reward, reward_info
 
 from typing import Tuple, Dict
 import math
 import torch
 from torch import Tensor
 @torch.jit.script
-def compute_reward(root_states: torch.Tensor, potentials: torch.Tensor, prev_potentials: torch.Tensor, dt: float) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    # root_states shape: (N, 13), with root position [x,y,z] in indices 0:3
-    # potentials shape: (N,) - current potentials (negative distance rate)
-    # prev_potentials shape: (N,) - previous potentials
-    # dt: time step duration as float
+def compute_reward(
+    root_states: torch.Tensor,  # (num_envs, 13)
+    potentials: torch.Tensor,   # (num_envs,)
+    prev_potentials: torch.Tensor,  # (num_envs,)
+    dt: float
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    # Reward component 1: forward progress reward based on increase in potentials
+    # potentials are negative distance to target / dt, so higher potentials mean closer
+    # difference potentials reward progress toward goal
+    progress = potentials - prev_potentials  # (num_envs,)
 
-    device = root_states.device
+    # Reward component 2: encourage slow forward velocity along the x-axis (assumed forward)
+    # Use linear velocity x component (root_states[:, 7]) to encourage slow forward walking
+    forward_vel = root_states[:, 7]  # linear velocity x component
+    # We'll encourage forward velocity near 0.5 without going too fast
+    # Define a temperature for Gaussian shaping of velocity reward (close to 0.5)
+    temp_vel = 0.1
+    target_vel = 0.5
+    vel_reward = torch.exp(-((forward_vel - target_vel) ** 2) / (2 * temp_vel ** 2))
 
-    # Reward component 1: Forward Velocity Reward (encourage positive forward velocity along x-axis)
-    # potentials encodes negative distance rate: potentials = -distance_to_target / dt
-    # We can use the difference potentials - prev_potentials to estimate forward progress
-    # The difference is positive if the agent moved closer to the target
+    # Reward component 3: encourage upright stance by dotting up vector with world Z-axis (0,0,1)
+    # We don't get the up_vec here, but can compute approx from root_states quaternion
+    # Alternatively, encourage low angular velocity to keep stable orientation
+    ang_vel = root_states[:, 10:13]
+    ang_vel_norm = torch.norm(ang_vel, dim=-1)
+    # Penalize large angular velocity (rotation)
+    temp_angvel = 0.1
+    stability_reward = torch.exp(- (ang_vel_norm ** 2) / (2 * temp_angvel ** 2))
 
-    forward_progress = potentials - prev_potentials  # shape (N,)
-    forward_reward = forward_progress * 10.0  # scale factor to amplify forward movement reward
+    # Combine rewards linearly with weights
+    w_progress = 3.0
+    w_vel = 2.0
+    w_stability = 1.0
 
-    # Reward component 2: Survival reward to encourage not falling (optional)
-    # We can check if torso z-position (root_states[:, 2]) is above a threshold (>0.26 typical for ant standing)
-    torso_z = root_states[:, 2]
-    upright_reward = torch.where(torso_z > 0.26, torch.tensor(1.0, device=device), torch.tensor(0.0, device=device))
+    total_reward = w_progress * progress + w_vel * vel_reward + w_stability * stability_reward
 
-    # Normalize rewards with temperature-scaled sigmoid to encourage moderate but continuous improvement
-    temp_forward = 0.1
-    temp_upright = 0.05
-    forward_reward_norm = torch.sigmoid(forward_reward / temp_forward)
-    upright_reward_norm = torch.sigmoid((upright_reward - 0.5) / temp_upright)
-
-    total_reward = forward_reward_norm + upright_reward_norm
-
-    reward_dict = {
-        "forward_reward": forward_reward_norm,
-        "upright_reward": upright_reward_norm,
-        "forward_progress_raw": forward_progress,
-        "torso_height": torso_z
+    reward_info = {
+        "progress": progress,
+        "vel_reward": vel_reward,
+        "stability_reward": stability_reward,
     }
 
-    return total_reward, reward_dict
+    return total_reward, reward_info

@@ -51,10 +51,10 @@ MODEL = "gpt-4.1-mini"
 SAMPLE = 2  # Number of reward functions GPT generates per iteration
 TRAINING_MODE = "individual"  # "individual" or "averaged"
 VLM_ITERATIONS = 1  # Number of VLM feedback loops (1 = 2 total GPT generations)
-MAX_ITERATIONS = 500  # RL training iterations per policy
+MAX_ITERATIONS = 1000  # RL training iterations per policy
 
 # Timeout per experiment (in seconds)
-TIMEOUT_SECONDS = 45 * 60  # 45 minutes (increased due to VLM feedback loop)
+TIMEOUT_SECONDS = 60 * 60  # 45 minutes (increased due to VLM feedback loop)
 
 # Pretrained checkpoints for specific environments (to start training from a good policy)
 # These are converted from skrl/HuggingFace pretrained models to rl_games format

@@ -1,5 +1,21 @@
 class Anymal(VecTask):
-    """Rest of the environment definition omitted."""
+    """Rest of the environment definition omitted.
+
+    Available tensors for reward function (accessible as self.X):
+    - root_states: (num_envs, 13) - positions [0:3], rotations [3:7], linear velocity [7:10], angular velocity [10:13]
+    - dof_pos: (num_envs, 12) - joint positions
+    - dof_vel: (num_envs, 12) - joint velocities
+    - default_dof_pos: (num_envs, 12) - default joint positions
+    - contact_forces: (num_envs, num_bodies, 3) - contact forces per body
+    - torques: (num_envs, 12) - joint torques
+    - commands: (num_envs, 3) - velocity commands [x_vel, y_vel, yaw_rate]
+    - actions: (num_envs, 12) - current actions
+    - gravity_vec: (num_envs, 3) - gravity vector
+    - dt: float - simulation timestep
+
+    Note: To get linear velocity, use root_states[:, 7:10]. To get angular velocity, use root_states[:, 10:13].
+    There is NO self.velocities attribute - always use root_states slicing.
+    """
     def compute_observations(self):
         self.gym.refresh_dof_state_tensor(self.sim)  # done in step
         self.gym.refresh_actor_root_state_tensor(self.sim)
