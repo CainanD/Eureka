@@ -1,0 +1,25 @@
+[2025-12-08 11:20:41,771][root][INFO] - Workspace: /data/user_data/wenjiel2/Code/roboly/eval/adverb_experiment_results_vlm/20251208_111815/ant_powerfully/outputs/eureka/2025-12-08_11-20-41
+[2025-12-08 11:20:41,771][root][INFO] - Project Root: /data/user_data/wenjiel2/Code/roboly/Eureka/eureka
+[2025-12-08 11:20:41,772][root][INFO] - Using LLM: gpt-4.1-mini
+[2025-12-08 11:20:41,772][root][INFO] - Task: Ant
+[2025-12-08 11:20:41,772][root][INFO] - Task description: make the ant walk forward powerfully
+[2025-12-08 11:20:41,772][root][INFO] - Loading checkpoint: /data/user_data/wenjiel2/Code/roboly/eval/pretrained_ant_converted.pth
+[2025-12-08 11:20:41,786][root][INFO] - Iteration 0: Generating 2 samples with gpt-4.1-mini
+[2025-12-08 11:20:57,988][httpx][INFO] - HTTP Request: POST https://ai-gateway.andrew.cmu.edu/chat/completions "HTTP/1.1 200 OK"
+[2025-12-08 11:20:57,997][root][INFO] - Iteration 0: Prompt Tokens: 1038, Completion Tokens: 2830, Total Tokens: 3868
+[2025-12-08 11:20:57,997][root][INFO] - Iteration 0: Processing Code Run 0
+[2025-12-08 11:20:58,249][root][INFO] - Iteration 0: Code Run 0 execution error!
+[2025-12-08 11:20:58,249][root][INFO] - Iteration 0: Processing Code Run 1
+[2025-12-08 11:20:58,501][root][INFO] - Iteration 0: Code Run 1 execution error!
+[2025-12-08 11:20:58,504][root][INFO] - All code generation failed! Repeat this iteration from the current message checkpoint!
+[2025-12-08 11:20:58,504][root][INFO] - Iteration 1: Generating 2 samples with gpt-4.1-mini
+[2025-12-08 11:21:07,655][httpx][INFO] - HTTP Request: POST https://ai-gateway.andrew.cmu.edu/chat/completions "HTTP/1.1 200 OK"
+[2025-12-08 11:21:07,656][root][INFO] - Iteration 1: Prompt Tokens: 1038, Completion Tokens: 2363, Total Tokens: 3401
+[2025-12-08 11:21:07,656][root][INFO] - Iteration 1: Processing Code Run 0
+[2025-12-08 11:21:07,927][root][INFO] - Iteration 1: Code Run 0 execution error!
+[2025-12-08 11:21:07,927][root][INFO] - Iteration 1: Processing Code Run 1
+[2025-12-08 11:21:08,371][root][INFO] - Iteration 1: Code Run 1 execution error!
+[2025-12-08 11:21:08,374][root][INFO] - All code generation failed! Repeat this iteration from the current message checkpoint!
+[2025-12-08 11:21:08,374][root][INFO] - All iterations of code generation failed, aborting...
+[2025-12-08 11:21:08,374][root][INFO] - Please double check the output env_iter*_response*.txt files for repeating errors!
+

@@ -182,10 +182,10 @@ class AntGPT(VecTask):
             self.extremities_index[i] = self.gym.find_actor_rigid_body_handle(self.envs[0], self.ant_handles[0], extremity_names[i])
 
     def compute_reward(self, actions):
-        self.rew_buf[:], self.rew_dict = compute_reward(self.root_states, self.potentials, self.prev_potentials, self.up_vec, self.heading_vec, self.actions, self.dof_vel, self.up_axis_idx)
+        self.rew_buf[:], self.rew_dict = compute_reward(self.root_states, self.potentials, self.prev_potentials, self.dt)
         self.extras['gpt_reward'] = self.rew_buf.mean()
         for rew_state in self.rew_dict: self.extras[rew_state] = self.rew_dict[rew_state].mean()
-        self.gt_rew_buf, _ = compute_success(self.root_states, self.potentials, self.prev_potentials, self.heading_vec, self.up_vec, self.actions, self.up_axis_idx)
+        self.gt_rew_buf, _ = compute_success(self.root_states, self.prev_potentials, self.potentials, self.velocities, self.up_vec, self.heading_vec, self.contact_force_scale)
         self.consecutive_successes[:] = self.gt_rew_buf.mean()
         self.extras['gt_reward'] = self.gt_rew_buf.mean()
         self.extras['consecutive_successes'] = self.consecutive_successes.mean()
@@ -303,241 +303,113 @@ def compute_ant_observations(obs_buf, root_states, targets, potentials,
     return obs, potentials, prev_potentials_new, up_vec, heading_vec
 
 @torch.jit.script
-def compute_success(
-    root_states: torch.Tensor,
-    potentials: torch.Tensor,
-    prev_potentials: torch.Tensor,
-    heading_vec: torch.Tensor,
-    up_vec: torch.Tensor,
-    actions: torch.Tensor,
-    up_axis_idx: int
-) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    # Ensure all tensors are on the same device
+def compute_success(root_states: torch.Tensor,
+                   prev_potentials: torch.Tensor,
+                   potentials: torch.Tensor,
+                   velocities: torch.Tensor,
+                   up_vec: torch.Tensor,
+                   heading_vec: torch.Tensor,
+                   contact_force_scale: float) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """
+    Reward function encouraging the ant to walk forward quickly.
+
+    Inputs:
+    - root_states: tensor of shape (N, 13) containing root state info:
+        positions (0:3), rotations (3:7), linear velocity (7:10), angular velocity (10:13)
+    - prev_potentials: tensor of shape (N,) previous potentials (negative distance/time)
+    - potentials: tensor of shape (N,) current potentials (negative distance/time)
+    - velocities: tensor of shape (N, 3), linear velocities extracted from root_states[:,7:10]
+    - up_vec: tensor of shape (N, 3) - up direction vector of the ant
+    - heading_vec: tensor of shape (N, 3) - forward heading vector of the ant
+    - contact_force_scale: float scalar to scale contact forces (for force penalty, here unused)
+
+    Returns:
+    - total reward tensor of shape (N,)
+    - dictionary of reward components
+    """
+
     device = root_states.device
 
-    # Extract world-frame linear velocity of the torso
-    vel = root_states[:, 7:10]
-    vel_xy = vel.clone()
-    vel_xy[:, 2] = 0.0
+    # 1. Forward progress reward: increase in "potential" (negative distance/time)
+    # potential is negative distance / dt, higher is better (less distance to goal)
+    # so potential - prev_potential > 0 means progress forward
+    reward_forward = potentials - prev_potentials  # shape (N,)
 
-    # Use the planar heading direction (toward the target) for forward progress
-    heading_xy = heading_vec.clone()
-    heading_xy[:, 2] = 0.0
-    eps = 1e-6
-    norm_heading = torch.clamp(torch.norm(heading_xy, dim=-1, keepdim=True), min=eps)
-    heading_dir = heading_xy / norm_heading
+    # Temperature for forward progress scaling in exp
+    temp_forward = 10.0
+    reward_forward_exp = torch.exp(temp_forward * reward_forward) - 1.0  # normalize, zero-centered
 
-    # Forward speed along heading
-    forward_speed = torch.sum(vel_xy * heading_dir, dim=-1)
+    # 2. Velocity alignment reward: project velocity onto heading vector (encourage forward velocity)
+    vel_forward = torch.sum(velocities * heading_vec, dim=-1)  # shape (N,)
+    # Reward positive forward velocity only
+    reward_vel = torch.clamp(vel_forward, min=0.0)
+    temp_vel = 2.5
+    reward_vel_exp = torch.tanh(temp_vel * reward_vel)
 
-    # Target progress shaping from potentials
-    progress = potentials - prev_potentials
-    progress_reward = torch.clamp(progress, min=0.0)
+    # 3. Upright reward: encourage up vector to align with global up (assumed [0,0,1])
+    global_up = torch.tensor([0.0, 0.0, 1.0], device=device)
+    cos_up = torch.sum(up_vec * global_up.view(1, 3), dim=-1)  # cosine similarity
+    # Reward close to upright posture
+    temp_up = 5.0
+    reward_upright = torch.exp(temp_up * (cos_up - 1.0))  # max 1 when cos_up=1, decays otherwise
 
-    # Velocity alignment reward (normalized via exponential transform)
-    temp_forward = 1.0  # temperature for velocity alignment
-    vel_align_reward = torch.exp(torch.clamp(forward_speed, min=0.0) / temp_forward) - 1.0
+    # Optionally: small penalty on contact forces to encourage smooth walking
+    # But contact forces tensor is not accessible here; omit for simplicity
 
-    # Lateral (sideways) speed penalty to discourage zig-zagging
-    dot_fwd = torch.sum(vel_xy * heading_dir, dim=-1, keepdim=True)
-    lateral_vec = vel_xy - dot_fwd * heading_dir
-    lateral_penalty = torch.norm(lateral_vec, dim=-1)
+    # Combine rewards with weights
+    w_forward = 1.0
+    w_vel = 0.5
+    w_upright = 0.3
 
-    # Upright posture reward via alignment with world up
-    e_up_full = torch.zeros((up_vec.shape[0], 3), device=device, dtype=up_vec.dtype)
-    e_up_full[:, up_axis_idx] = 1.0
-    up_alignment = torch.sum(up_vec * e_up_full, dim=-1)  # in [-1, 1]
-    temp_upright = 0.25  # temperature for upright transform
-    upright_reward = torch.exp((up_alignment - 1.0) / temp_upright)
+    total_reward = w_forward * reward_forward_exp + w_vel * reward_vel_exp + w_upright * reward_upright
 
-    # Speed bonus to encourage fast walking forward (saturating via exponential)
-    temp_speed = 2.0  # temperature for speed bonus
-    speed_bonus = torch.exp(torch.clamp(forward_speed, min=0.0) / temp_speed) - 1.0
-
-    # Action penalty to reduce excessive torques
-    action_penalty = torch.sum(actions * actions, dim=-1)
-
-    # Small alive bonus to stabilize learning
-    alive_bonus = torch.ones_like(progress_reward) * 0.05
-
-    # Weights for combining components
-    w_progress = 1.0
-    w_vel_align = 0.5
-    w_lateral = 0.1
-    w_upright = 0.2
-    w_speed = 0.5
-    w_action = 0.01
-
-    total_reward = (
-        w_progress * progress_reward
-        + w_vel_align * vel_align_reward
-        + w_upright * upright_reward
-        + w_speed * speed_bonus
-        + alive_bonus
-        - w_lateral * lateral_penalty
-        - w_action * action_penalty
-    )
-
-    components: Dict[str, torch.Tensor] = {
-        "progress_reward": progress_reward,
-        "vel_align_reward": vel_align_reward,
-        "upright_reward": upright_reward,
-        "speed_bonus": speed_bonus,
-        "lateral_penalty": lateral_penalty,
-        "action_penalty": action_penalty,
-        "alive_bonus": alive_bonus,
-        "forward_speed": forward_speed,
+    rewards_dict = {
+        "reward_forward": reward_forward_exp,
+        "reward_velocity": reward_vel_exp,
+        "reward_upright": reward_upright,
     }
 
-    return total_reward, components
+    return total_reward, rewards_dict
 
 from typing import Tuple, Dict
 import math
 import torch
 from torch import Tensor
 @torch.jit.script
-def compute_reward(
-    root_states: torch.Tensor,
-    potentials: torch.Tensor,
-    prev_potentials: torch.Tensor,
-    up_vec: torch.Tensor,
-    heading_vec: torch.Tensor,
-    actions: torch.Tensor,
-    dof_vel: torch.Tensor,
-    up_axis_idx: int
-) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    # device
+def compute_reward(root_states: torch.Tensor, potentials: torch.Tensor, prev_potentials: torch.Tensor, dt: float) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    # root_states shape: (N, 13), with root position [x,y,z] in indices 0:3
+    # potentials shape: (N,) - current potentials (negative distance rate)
+    # prev_potentials shape: (N,) - previous potentials
+    # dt: time step duration as float
+
     device = root_states.device
 
-    # Extract useful quantities from root_states
-    torso_pos = root_states[:, 0:3]
-    velocity = root_states[:, 7:10]
-    ang_velocity = root_states[:, 10:13]
+    # Reward component 1: Forward Velocity Reward (encourage positive forward velocity along x-axis)
+    # potentials encodes negative distance rate: potentials = -distance_to_target / dt
+    # We can use the difference potentials - prev_potentials to estimate forward progress
+    # The difference is positive if the agent moved closer to the target
 
-    # Planar components (zero out vertical)
-    v_planar = velocity.clone()
-    v_planar[:, up_axis_idx] = 0.0
+    forward_progress = potentials - prev_potentials  # shape (N,)
+    forward_reward = forward_progress * 10.0  # scale factor to amplify forward movement reward
 
-    h_planar = heading_vec.clone()
-    h_planar[:, up_axis_idx] = 0.0
+    # Reward component 2: Survival reward to encourage not falling (optional)
+    # We can check if torso z-position (root_states[:, 2]) is above a threshold (>0.26 typical for ant standing)
+    torso_z = root_states[:, 2]
+    upright_reward = torch.where(torso_z > 0.26, torch.tensor(1.0, device=device), torch.tensor(0.0, device=device))
 
-    # Normalize heading planar vector
-    eps: float = 1e-6
-    h_norm = torch.norm(h_planar, p=2, dim=-1)
-    h_norm_safe = h_norm + eps
-    h_unit = h_planar / h_norm_safe.unsqueeze(-1)
+    # Normalize rewards with temperature-scaled sigmoid to encourage moderate but continuous improvement
+    temp_forward = 0.1
+    temp_upright = 0.05
+    forward_reward_norm = torch.sigmoid(forward_reward / temp_forward)
+    upright_reward_norm = torch.sigmoid((upright_reward - 0.5) / temp_upright)
 
-    # Forward speed in direction of heading
-    forward_speed_raw = torch.sum(v_planar * h_unit, dim=-1)
+    total_reward = forward_reward_norm + upright_reward_norm
 
-    # Velocity unit for alignment
-    v_norm = torch.norm(v_planar, p=2, dim=-1)
-    v_norm_safe = v_norm + eps
-    v_unit = v_planar / v_norm_safe.unsqueeze(-1)
+    reward_dict = {
+        "forward_reward": forward_reward_norm,
+        "upright_reward": upright_reward_norm,
+        "forward_progress_raw": forward_progress,
+        "torso_height": torso_z
+    }
 
-    # Alignment between velocity and heading (clipped to [0, 1])
-    align = torch.sum(v_unit * h_unit, dim=-1)
-    align_pos = torch.clamp(align, min=0.0, max=1.0)
-
-    # Potential-based progress (closer to target -> higher progress), gated by uprightness
-    progress = potentials - prev_potentials
-
-    # Uprightness using up_vec projected on global up axis, used as a gate
-    upright_cos = torch.clamp(up_vec[:, up_axis_idx], 0.0, 1.0)
-    gate = upright_cos
-
-    # Speed tracking: encourage a comfortable forward speed near target
-    v_target: float = 1.2  # target forward speed (m/s)
-    temp_speed_track: float = 1.0  # temperature controls width of the peak
-    speed_err = forward_speed_raw - v_target
-    # bounded in (0, 1], peaks at v_target
-    speed_track = torch.exp(-(speed_err * speed_err) / temp_speed_track) * gate
-
-    # Penalize moving backward
-    backward_pen = torch.clamp(-forward_speed_raw, min=0.0)
-
-    # Lateral motion away from heading
-    planar_speed_sq = torch.sum(v_planar * v_planar, dim=-1)
-    forward_comp_sq = forward_speed_raw * forward_speed_raw
-    lateral_sq = torch.clamp(planar_speed_sq - torch.clamp(forward_comp_sq, min=0.0), min=0.0)
-
-    # Yaw rate penalty (spin around up axis)
-    yaw_rate = ang_velocity[:, up_axis_idx]
-    yaw_pen = yaw_rate * yaw_rate
-
-    # Roll/Pitch angular velocity penalty (thrashing reduction)
-    ang_vel_rp = ang_velocity.clone()
-    ang_vel_rp[:, up_axis_idx] = 0.0
-    roll_pitch_pen = torch.sum(ang_vel_rp * ang_vel_rp, dim=-1)
-
-    # Action magnitude penalty (energy/smoothness)
-    action_pen = torch.sum(actions * actions, dim=-1)
-
-    # Joint velocity penalty (encourage smooth, stable gait)
-    dof_vel_sq = dof_vel * dof_vel
-    joint_vel_pen = torch.mean(dof_vel_sq, dim=-1)
-
-    # Height (optional small encouragement to stay near nominal height)
-    height = torso_pos[:, up_axis_idx]
-    h_target: float = 0.35
-    temp_height: float = 0.20
-    height_dev = torch.abs(height - h_target)
-    height_reward = torch.exp((-height_dev) / temp_height) * gate
-
-    # Weights
-    w_alive: float = 0.02
-    w_progress: float = 0.8
-    w_speed_track: float = 3.0
-    w_upright: float = 0.6
-    w_align: float = 0.5
-    w_height: float = 0.2
-
-    w_lateral_pen: float = 0.05
-    w_yaw_pen: float = 0.03
-    w_rollpitch_pen: float = 0.02
-    w_action_pen: float = 0.005
-    w_joint_vel_pen: float = 0.001
-    w_backward_pen: float = 0.5
-
-    alive_bonus = torch.full_like(progress, w_alive, device=device)
-
-    # Total reward
-    total_reward = (
-        alive_bonus
-        + w_progress * (progress * gate)
-        + w_speed_track * speed_track
-        + w_upright * upright_cos
-        + w_align * align_pos
-        + w_height * height_reward
-        - w_lateral_pen * lateral_sq
-        - w_yaw_pen * yaw_pen
-        - w_rollpitch_pen * roll_pitch_pen
-        - w_action_pen * action_pen
-        - w_joint_vel_pen * joint_vel_pen
-        - w_backward_pen * backward_pen
-    )
-
-    # Components dictionary
-    comps: Dict[str, torch.Tensor] = {}
-    comps["alive_bonus"] = alive_bonus
-    comps["progress"] = w_progress * (progress * gate)
-    comps["speed_track"] = w_speed_track * speed_track
-    comps["upright"] = w_upright * upright_cos
-    comps["align"] = w_align * align_pos
-    comps["height"] = w_height * height_reward
-
-    comps["lateral_pen"] = -w_lateral_pen * lateral_sq
-    comps["yaw_pen"] = -w_yaw_pen * yaw_pen
-    comps["roll_pitch_pen"] = -w_rollpitch_pen * roll_pitch_pen
-    comps["action_pen"] = -w_action_pen * action_pen
-    comps["joint_vel_pen"] = -w_joint_vel_pen * joint_vel_pen
-    comps["backward_pen"] = -w_backward_pen * backward_pen
-
-    # Raw diagnostics
-    comps["forward_speed_raw"] = forward_speed_raw
-    comps["upright_raw"] = upright_cos
-    comps["height_raw"] = height
-    comps["alignment_raw"] = align_pos
-    comps["gate"] = gate
-
-    return total_reward, comps
+    return total_reward, reward_dict

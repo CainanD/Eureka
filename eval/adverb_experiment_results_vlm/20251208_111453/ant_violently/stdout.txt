@@ -1,0 +1,28 @@
+Error executing job with overrides: ['model=gpt-4.1-mini', 'iteration=2', 'sample=2', 'env=ant', 'env.description=make the ant walk forward violently', 'checkpoint=/data/user_data/wenjiel2/Code/roboly/eval/pretrained_ant_converted.pth']
+Traceback (most recent call last):
+  File "/data/user_data/wenjiel2/Code/roboly/Eureka/eureka/eureka.py", line 275, in main
+    set_freest_gpu()
+  File "/data/user_data/wenjiel2/Code/roboly/Eureka/eureka/utils/misc.py", line 13, in set_freest_gpu
+    freest_gpu = get_freest_gpu()
+  File "/data/user_data/wenjiel2/Code/roboly/Eureka/eureka/utils/misc.py", line 17, in get_freest_gpu
+    sp = subprocess.Popen(['gpustat', '--json'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+  File "/data/user_data/wenjiel2/miniconda3/envs/eureka/lib/python3.8/subprocess.py", line 858, in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+  File "/data/user_data/wenjiel2/miniconda3/envs/eureka/lib/python3.8/subprocess.py", line 1720, in _execute_child
+    raise child_exception_type(errno_num, err_msg, err_filename)
+FileNotFoundError: [Errno 2] No such file or directory: 'gpustat'
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.
+
+ERROR conda.cli.main_run:execute(125): `conda run python /data/user_data/wenjiel2/Code/roboly/Eureka/eureka/eureka.py model=gpt-4.1-mini iteration=2 sample=2 env=ant env.description=make the ant walk forward violently checkpoint=/data/user_data/wenjiel2/Code/roboly/eval/pretrained_ant_converted.pth` failed. (See above for error)
+[2025-12-08 11:15:23,336][root][INFO] - Workspace: /data/user_data/wenjiel2/Code/roboly/eval/adverb_experiment_results_vlm/20251208_111453/ant_violently/outputs/eureka/2025-12-08_11-15-23
+[2025-12-08 11:15:23,337][root][INFO] - Project Root: /data/user_data/wenjiel2/Code/roboly/Eureka/eureka
+[2025-12-08 11:15:23,337][root][INFO] - Using LLM: gpt-4.1-mini
+[2025-12-08 11:15:23,337][root][INFO] - Task: Ant
+[2025-12-08 11:15:23,337][root][INFO] - Task description: make the ant walk forward violently
+[2025-12-08 11:15:23,337][root][INFO] - Loading checkpoint: /data/user_data/wenjiel2/Code/roboly/eval/pretrained_ant_converted.pth
+[2025-12-08 11:15:23,352][root][INFO] - Iteration 0: Generating 2 samples with gpt-4.1-mini
+[2025-12-08 11:15:39,599][httpx][INFO] - HTTP Request: POST https://ai-gateway.andrew.cmu.edu/chat/completions "HTTP/1.1 200 OK"
+[2025-12-08 11:15:39,609][root][INFO] - Iteration 0: Prompt Tokens: 1037, Completion Tokens: 2307, Total Tokens: 3344
+[2025-12-08 11:15:39,609][root][INFO] - Iteration 0: Processing Code Run 0
+

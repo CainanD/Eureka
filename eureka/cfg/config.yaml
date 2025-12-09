@@ -15,13 +15,12 @@ temperature: 1.0
 suffix: GPT  # suffix for generated files (indicates LLM model)
 
 # Eureka parameters
-iteration: 2 # how many iterations of Eureka to run
-sample: 2 # number of Eureka samples to generate per iteration
-max_iterations: 500 #1000 # RL Policy training iterations (episodes) (decrease this to make the feedback loop faster)
-num_eval: 1 # number of evaluation episodes to run for the final reward
+sample: 2 # number of reward functions GPT generates per iteration
+training_mode: individual # "individual" (train n separate policies) or "averaged" (train 1 policy with averaged reward)
+vlm_iterations: 1 # number of VLM feedback loops (default=1 means 2 total GPT generations)
+max_iterations: 500 # RL Policy training iterations (decrease this to make the feedback loop faster)
 capture_video: True # whether to capture policy rollout videos
-vlm_feedback: True # whether to give feedback from a VLM to the trainer LLM
-manual_success: False # whether to give 
+manual_success: False # whether to use manual success function 
 
 checkpoint: "" # path to checkpoint to load (if any)
 

@@ -15,11 +15,12 @@ def find_highest_consecutive_episodes(video_dir):
         video_dir: Path to directory containing rl-video-episode-{i}.mp4 files
     Returns:
         Tuple of (first_episode_num, second_episode_num, first_video_path, second_video_path)
+        OR (episode_num, None, video_path, None) if only one episode exists
     """
     # Find all video files matching the pattern recursively
     video_pattern = re.compile(r'rl-video-episode-(\d+)\.mp4')
     episodes = []
-    
+
     # Walk through all subdirectories
     for root, dirs, files in os.walk(video_dir):
         for filename in files:
@@ -27,13 +28,17 @@ def find_highest_consecutive_episodes(video_dir):
             if match:
                 episode_num = int(match.group(1))
                 episodes.append((episode_num, os.path.join(root, filename)))
-    
-    if len(episodes) < 2:
-        raise ValueError("Need at least 2 videos to find consecutive episodes")
-    
+
+    if len(episodes) == 0:
+        raise ValueError("No video episodes found")
+
     # Sort by episode number
     episodes.sort(key=lambda x: x[0])
-    
+
+    # If only one episode, return it (no merging needed)
+    if len(episodes) == 1:
+        return (episodes[0][0], None, episodes[0][1], None)
+
     # Find the highest consecutive pair
     highest_consecutive = None
     for i in range(len(episodes) - 1):
@@ -41,10 +46,11 @@ def find_highest_consecutive_episodes(video_dir):
         next_ep, next_path = episodes[i + 1]
         if next_ep == current_ep + 1:
             highest_consecutive = (current_ep, next_ep, current_path, next_path)
-    
+
+    # If no consecutive episodes, just return the last two
     if highest_consecutive is None:
-        raise ValueError("No consecutive episodes found")
-    
+        return (episodes[-2][0], episodes[-1][0], episodes[-2][1], episodes[-1][1])
+
     return highest_consecutive
 
 def merge_videos(first_video_path, second_video_path, output_path):
@@ -113,27 +119,27 @@ def merge_videos(first_video_path, second_video_path, output_path):
 def process_episode_clips(video_dir, output_path):
     """
     Main function to find consecutive videos and merge them.
-    
+
     Args:
         video_dir: Directory containing rl-video-episode-{i}.mp4 files
-        output_dir: Directory where merged video will be saved
+        output_path: Path where merged/copied video will be saved
     """
+    import shutil
+
     # Create output directory if it doesn't exist
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    
+
     # Find highest consecutive episodes
     ep1, ep2, path1, path2 = find_highest_consecutive_episodes(video_dir)
-    #print(f"Found consecutive episodes: {ep1} and {ep2}")
-    #print(f"Video 1: {path1}")
-    #print(f"Video 2: {path2}")
-    # Create output filename
-    
-    # Merge the videos
-    #print(f"\nMerging videos to: {output_path}")
-    merge_videos(path1, path2, output_path)
-    
-    #print(f"\nSuccessfully created merged video: {output_path}")
-    return output_path
+
+    if path2 is None:
+        # Only one episode - just copy it
+        shutil.copy(path1, output_path)
+    else:
+        # Merge the videos
+        merge_videos(path1, path2, str(output_path))
+
+    return str(output_path)
 
 def get_vlm_feedback(task_description: str, policy_video_path: str) -> str:
     # Only for videos of size <20Mb
@@ -168,40 +174,160 @@ def get_vlm_feedback(task_description: str, policy_video_path: str) -> str:
 
     #print(response)
     with open(policy_video_path.parent/'full_response.txt', 'w') as f:
+        f.write(f"Video: {policy_video_path}\n")
+        f.write(f"Task: {task_description}\n")
+        f.write("="*60 + "\n\n")
         f.write(str(response))
 
     return response.text
 
 
+def get_vlm_selection(task_description: str, video_paths: list) -> tuple:
+    """
+    Ask Gemini to select the best video from multiple policy videos.
+
+    Args:
+        task_description: Description of the task
+        video_paths: List of paths to video files
+
+    Returns:
+        Tuple of (best_index, reasoning_text)
+    """
+    client = genai.Client()
+
+    config = types.GenerateContentConfig(
+        media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH,
+    )
+
+    # Build parts list with all videos
+    parts = []
+    for i, video_path in enumerate(video_paths):
+        video_bytes = open(video_path, "rb").read()
+        parts.append(types.Part(
+            inline_data=types.Blob(data=video_bytes, mime_type="video/mp4"),
+            video_metadata=types.VideoMetadata(fps=5),
+        ))
+        parts.append(types.Part(text=f"[Video {i}]"))
+
+    # Add the selection prompt
+    parts.append(types.Part(
+        text=f"""
+We trained {len(video_paths)} robot policies in simulation to execute a task with the description "{task_description}".
+
+The videos above show each policy's performance (labeled Video 0, Video 1, etc.).
+
+Please:
+1. Evaluate each policy's performance on the task
+2. Select the BEST policy (the one that best achieves the task description)
+3. Explain your reasoning
+
+Your response MUST include a line in this exact format:
+BEST_POLICY: <number>
+
+For example, if Video 2 is best, write:
+BEST_POLICY: 2
+
+Then provide your detailed reasoning and feedback for improvement.
+"""
+    ))
+
+    response = client.models.generate_content(
+        model="models/gemini-3-pro-preview",
+        contents=types.Content(parts=parts),
+        config=config
+    )
+
+    response_text = response.text
+
+    # Save full response to file in same directory as first video
+    output_dir = Path(video_paths[0]).parent
+    with open(output_dir / 'selection_response.txt', 'w') as f:
+        f.write(f"Task: {task_description}\n")
+        f.write("Videos:\n")
+        for i, vp in enumerate(video_paths):
+            f.write(f"  [{i}] {vp}\n")
+        f.write("="*60 + "\n\n")
+        f.write(str(response))
+
+    # Parse the best policy index from response
+    match = re.search(r'BEST_POLICY:\s*(\d+)', response_text)
+    if match:
+        best_idx = int(match.group(1))
+        # Validate index is in range
+        if 0 <= best_idx < len(video_paths):
+            return best_idx, response_text
+
+    # If parsing fails, default to first video
+    return 0, response_text
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='VLM Evaluation for video analysis')
-    
+
     parser.add_argument(
-        'task_description',
+        '--mode',
         type=str,
-        nargs='?',
-        default='Throw the ball at the target.',
+        choices=['feedback', 'selection', 'process'],
+        default='feedback',
+        help='Mode: feedback (single video), selection (multiple videos), process (merge clips)'
+    )
+
+    parser.add_argument(
+        '--task',
+        type=str,
+        default='Complete the task.',
         help='Description of the task being evaluated'
     )
-    
+
     parser.add_argument(
-        'video_dir',
+        '--video',
         type=str,
-        nargs='?',
-        default='/home/ttr/Eureka-VLM/Eureka/eureka/outputs/eureka/2025-12-01_13-18-21/policy_iter0_response1/videos',
-        help='Directory containing the video clips'
+        help='Path to video file (for feedback mode)'
     )
-    
+
     parser.add_argument(
-        'processed_video_path',
+        '--videos',
         type=str,
-        nargs='?',
-        default='processed_video.mp4',
-        help='Output path for the processed video'
+        help='Comma-separated paths to video files (for selection mode)'
     )
-    
+
+    parser.add_argument(
+        '--video-dir',
+        type=str,
+        help='Directory containing video clips (for process mode)'
+    )
+
+    parser.add_argument(
+        '--output',
+        type=str,
+        help='Output path for processed video (for process mode)'
+    )
+
     args = parser.parse_args()
 
-    process_episode_clips(Path(args.video_dir), Path(args.processed_video_path))
-    result = get_vlm_feedback(args.task_description, Path(args.processed_video_path))
-    print(result)
+    if args.mode == 'process':
+        # Process video clips - merge consecutive episodes
+        if not args.video_dir or not args.output:
+            print("Error: --video-dir and --output required for process mode")
+            sys.exit(1)
+        process_episode_clips(Path(args.video_dir), Path(args.output))
+        print(f"Processed video saved to: {args.output}")
+
+    elif args.mode == 'feedback':
+        # Get feedback on single video
+        if not args.video:
+            print("Error: --video required for feedback mode")
+            sys.exit(1)
+        result = get_vlm_feedback(args.task, args.video)
+        print(result)
+
+    elif args.mode == 'selection':
+        # Select best from multiple videos
+        if not args.videos:
+            print("Error: --videos required for selection mode")
+            sys.exit(1)
+        video_paths = args.videos.split(',')
+        best_idx, reasoning = get_vlm_selection(args.task, video_paths)
+        # Output format: first line is index, rest is reasoning
+        print(best_idx)
+        print(reasoning)
