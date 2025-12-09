@@ -1,9 +1,0 @@
-Could not override 'iteration'.
-To append to your config use +iteration=1
-Key 'iteration' is not in struct
-    full_key: iteration
-    object_type=dict
-
-Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.
-
-ERROR conda.cli.main_run:execute(125): `conda run python /data/user_data/wenjiel2/Code/roboly/Eureka/eureka/eureka.py model=gpt-4.1-mini iteration=1 sample=1 env=ant env.description=make the ant walk forward quickly checkpoint=/data/user_data/wenjiel2/Code/roboly/eval/pretrained_ant_converted.pth` failed. (See above for error)
